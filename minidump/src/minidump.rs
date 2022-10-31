@@ -539,7 +539,7 @@ pub struct MinidumpException<'a> {
     /// `thread_id`, since it points to the code location where the exception happened,
     /// without any exception handling routines that are likely to be on the stack after
     /// that point.
-    context: Option<&'a [u8]>,
+    pub context: Option<&'a [u8]>,
     /// Saved endianess for lazy parsing.
     endian: scroll::Endian,
 }

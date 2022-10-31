@@ -1121,7 +1121,7 @@ pub struct CONTEXT_ARM64_OLD {
 /// NOTE: if you ever decide to try to make this repr(C) and get really clever,
 /// note that microsoft aligns this to 16 (and as of this writing, rust does
 /// not consistently aling u128 as such).
-#[derive(Debug, Default, Clone, Pread, SizeWith)]
+#[derive(Debug, Default, Clone, Pread, Pwrite, SizeWith)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct CONTEXT_ARM64 {
     pub context_flags: u32,
@@ -1160,7 +1160,7 @@ impl Arm64RegisterNumbers {
 }
 
 /// MIPS floating point state
-#[derive(Debug, Default, Clone, Pread, SizeWith)]
+#[derive(Debug, Default, Clone, Pread, Pwrite, SizeWith)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct FLOATING_SAVE_AREA_MIPS {
     pub regs: [u64; 32],
@@ -1171,7 +1171,7 @@ pub struct FLOATING_SAVE_AREA_MIPS {
 /// A MIPS CPU context
 ///
 /// This is a Breakpad extension, as there is no definition of `CONTEXT` for MIPS in WinNT.h.
-#[derive(Debug, Default, Clone, Pread, SizeWith)]
+#[derive(Debug, Default, Clone, Pread, Pwrite, SizeWith)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct CONTEXT_MIPS {
     pub context_flags: u32,
@@ -1228,7 +1228,7 @@ impl MipsRegisterNumbers {
 }
 
 /// PPC floating point state
-#[derive(Debug, Clone, Pread, SizeWith)]
+#[derive(Debug, Clone, Pread, Pwrite, SizeWith)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct FLOATING_SAVE_AREA_PPC {
     pub fpregs: [u64; 32],
@@ -1237,7 +1237,7 @@ pub struct FLOATING_SAVE_AREA_PPC {
 }
 
 /// PPC vector state
-#[derive(Debug, Clone, Pread, SizeWith)]
+#[derive(Debug, Clone, Pread, Pwrite, SizeWith)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct VECTOR_SAVE_AREA_PPC {
     pub save_vr: [u128; 32],
@@ -1250,7 +1250,7 @@ pub struct VECTOR_SAVE_AREA_PPC {
 /// A PPC CPU context
 ///
 /// This is a Breakpad extension, as there is no definition of `CONTEXT` for PPC in WinNT.h.
-#[derive(Debug, Clone, Pread, SizeWith)]
+#[derive(Debug, Clone, Pread, Pwrite, SizeWith)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct CONTEXT_PPC {
     pub context_flags: u32,
@@ -1277,7 +1277,7 @@ pub enum PpcRegisterNumbers {
 /// A PPC64 CPU context
 ///
 /// This is a Breakpad extension, as there is no definition of `CONTEXT` for PPC64 in WinNT.h.
-#[derive(Debug, Clone, Pread, SizeWith)]
+#[derive(Debug, Clone, Pread, Pwrite, SizeWith)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct CONTEXT_PPC64 {
     pub context_flags: u64,
@@ -1301,7 +1301,7 @@ pub enum Ppc64RegisterNumbers {
 }
 
 /// SPARC floating point state
-#[derive(Debug, Clone, Pread, SizeWith)]
+#[derive(Debug, Clone, Pread, Pwrite, SizeWith)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct FLOATING_SAVE_AREA_SPARC {
     pub regs: [u64; 32],
@@ -1312,7 +1312,7 @@ pub struct FLOATING_SAVE_AREA_SPARC {
 /// A SPARC CPU context
 ///
 /// This is a Breakpad extension, as there is no definition of `CONTEXT` for SPARC in WinNT.h.
-#[derive(Debug, Clone, Pread, SizeWith)]
+#[derive(Debug, Clone, Pread, Pwrite, SizeWith)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct CONTEXT_SPARC {
     pub context_flags: u32,

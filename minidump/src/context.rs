@@ -4,7 +4,7 @@
 //! CPU contexts.
 
 use num_traits::FromPrimitive;
-use scroll::{self, Pread};
+use scroll::{self, Pread, Pwrite};
 use std::collections::HashSet;
 use std::fmt;
 use std::io;
@@ -1174,6 +1174,85 @@ impl MinidumpContext {
                 }
             }
             _ => Err(ContextError::UnknownCpuContext),
+        }
+    }
+
+    /// Write a `MinidumpContext` to a Vec<u8>.
+    pub fn write(&self, endian: scroll::Endian) -> Result<Vec<u8>, ContextError> {
+        let mut bytes = Vec::new();
+        match self.raw {
+            MinidumpRawContext::Amd64(ref ctx) => {
+                let mut offset: usize = 0;
+                bytes.resize(std::mem::size_of_val(ctx), 0);
+                let _size = bytes
+                    .gwrite_with(ctx, &mut offset, endian)
+                    .or(Err(ContextError::ReadFailure))?;
+                Ok(bytes)
+            }
+            MinidumpRawContext::Arm(ref ctx) => {
+                let mut offset: usize = 0;
+                bytes.resize(std::mem::size_of_val(ctx), 0);
+                let _size = bytes
+                    .gwrite_with(ctx, &mut offset, endian)
+                    .or(Err(ContextError::ReadFailure))?;
+                Ok(bytes)
+            }
+            MinidumpRawContext::Arm64(ref ctx) => {
+                let mut offset: usize = 0;
+                bytes.resize(std::mem::size_of_val(ctx), 0);
+                let _size = bytes
+                    .gwrite_with(ctx, &mut offset, endian)
+                    .or(Err(ContextError::ReadFailure))?;
+                Ok(bytes)
+            }
+            MinidumpRawContext::OldArm64(ref ctx) => {
+                let mut offset: usize = 0;
+                bytes.resize(std::mem::size_of_val(ctx), 0);
+                let _size = bytes
+                    .gwrite_with(ctx, &mut offset, endian)
+                    .or(Err(ContextError::ReadFailure))?;
+                Ok(bytes)
+            }
+            MinidumpRawContext::Ppc(ref ctx) => {
+                let mut offset: usize = 0;
+                bytes.resize(std::mem::size_of_val(ctx), 0);
+                let _size = bytes
+                    .gwrite_with(ctx, &mut offset, endian)
+                    .or(Err(ContextError::ReadFailure))?;
+                Ok(bytes)
+            }
+            MinidumpRawContext::Ppc64(ref ctx) => {
+                let mut offset: usize = 0;
+                bytes.resize(std::mem::size_of_val(ctx), 0);
+                let _size = bytes
+                    .gwrite_with(ctx, &mut offset, endian)
+                    .or(Err(ContextError::ReadFailure))?;
+                Ok(bytes)
+            }
+            MinidumpRawContext::Sparc(ref ctx) => {
+                let mut offset: usize = 0;
+                bytes.resize(std::mem::size_of_val(ctx), 0);
+                let _size = bytes
+                    .gwrite_with(ctx, &mut offset, endian)
+                    .or(Err(ContextError::ReadFailure))?;
+                Ok(bytes)
+            }
+            MinidumpRawContext::X86(ref ctx) => {
+                let mut offset: usize = 0;
+                bytes.resize(std::mem::size_of_val(ctx), 0);
+                let _size = bytes
+                    .gwrite_with(ctx, &mut offset, endian)
+                    .or(Err(ContextError::ReadFailure))?;
+                Ok(bytes)
+            }
+            MinidumpRawContext::Mips(ref ctx) => {
+                let mut offset: usize = 0;
+                bytes.resize(std::mem::size_of_val(ctx), 0);
+                let _size = bytes
+                    .gwrite_with(ctx, &mut offset, endian)
+                    .or(Err(ContextError::ReadFailure))?;
+                Ok(bytes)
+            }
         }
     }
 

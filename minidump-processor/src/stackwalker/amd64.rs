@@ -254,7 +254,7 @@ where
     let last_sp = ctx.rsp;
 
     // Number of pointer-sized values to scan through in our search.
-    let default_scan_range = 40;
+    let default_scan_range = 240;
     let extended_scan_range = default_scan_range * 4;
 
     // Breakpad devs found that the first frame of an unwind can be really messed up,
