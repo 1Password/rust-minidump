@@ -32,7 +32,6 @@
 //! [crashpad]: https://chromium.googlesource.com/crashpad/crashpad/+/master/README.md
 #![allow(non_camel_case_types)]
 #![allow(non_upper_case_globals)]
-#![allow(clippy::upper_case_acronyms)]
 
 use std::fmt;
 
@@ -312,6 +311,12 @@ pub enum MINIDUMP_STREAM_TYPE {
     ///
     /// See ['MINIDUMP_MAC_CRASH_INFO'].
     MozMacosCrashInfoStream = 0x4d7a0001,
+
+    /// The kernel boot args on the machine where the crashed process is
+    /// running. Only available on macOS. 0x4D7A = "Mz".
+    ///
+    /// See ['MINIDUMP_MAC_BOOTARGS']
+    MozMacosBootargsStream = 0x4d7a0002,
 }
 
 impl From<MINIDUMP_STREAM_TYPE> for u32 {
@@ -373,7 +378,7 @@ pub struct MINIDUMP_MODULE {
 /// This struct matches the [Microsoft struct][msdn] of the same name.
 ///
 /// [msdn]: https://docs.microsoft.com/en-us/windows/win32/api/minidumpapiset/ns-minidumpapiset-minidump_unloaded_module
-#[derive(Debug, Clone, Default, Pread, SizeWith)]
+#[derive(Debug, Clone, Default, Pread, Pwrite, SizeWith)]
 pub struct MINIDUMP_UNLOADED_MODULE {
     /// The base address of the executable image in memory (when it was loaded).
     pub base_of_image: u64,
@@ -660,7 +665,7 @@ impl<'a> scroll::ctx::TryFromCtx<'a, Endian> for CV_INFO_ELF {
 }
 
 /// Obsolete debug record type defined in WinNT.h.
-#[derive(Debug, Clone, Pread, SizeWith)]
+#[derive(Debug, Clone, Pread, Pwrite, SizeWith)]
 pub struct IMAGE_DEBUG_MISC {
     pub data_type: u32,
     pub length: u32,
@@ -922,7 +927,7 @@ pub struct XMM_SAVE_AREA32 {
 ///
 /// This is defined as an anonymous struct inside an anonymous union in
 /// the x86-64 CONTEXT struct in WinNT.h.
-#[derive(Debug, Clone, Pread, SizeWith)]
+#[derive(Debug, Clone, Pread, Pwrite, SizeWith)]
 pub struct SSE_REGISTERS {
     pub header: [u128; 2],
     pub legacy: [u128; 8],
@@ -1404,7 +1409,7 @@ pub struct CPU_INFORMATION {
 ///
 /// This struct matches the definition of the struct of the same name from minidumpapiset.h,
 /// which is contained within the [`CPU_INFORMATION`] union.
-#[derive(Debug, Clone, Pread, SizeWith)]
+#[derive(Debug, Clone, Pread, Pwrite, SizeWith)]
 pub struct X86CpuInfo {
     pub vendor_id: [u32; 3],
     pub version_information: u32,
@@ -1413,7 +1418,7 @@ pub struct X86CpuInfo {
 }
 
 /// Arm-specific CPU information (Breakpad extension)
-#[derive(Debug, Clone, Pread, SizeWith)]
+#[derive(Debug, Clone, Pread, Pwrite, SizeWith)]
 pub struct ARMCpuInfo {
     pub cpuid: u32,
     /// Hardware capabilities
@@ -1426,7 +1431,7 @@ pub struct ARMCpuInfo {
 ///
 /// This struct matches the definition of the struct of the same name from minidumpapiset.h,
 /// which is contained within the [`CPU_INFORMATION`] union.
-#[derive(Debug, Clone, Pread, SizeWith)]
+#[derive(Debug, Clone, Pread, Pwrite, SizeWith)]
 pub struct OtherCpuInfo {
     pub processor_features: [u64; 2],
 }
@@ -1817,7 +1822,7 @@ bitflags! {
 /// This struct matches the [Microsoft struct][msdn] of the same name.
 ///
 /// [msdn]: https://docs.microsoft.com/en-us/windows/win32/api/minidumpapiset/ns-minidumpapiset-minidump_memory_info_list
-#[derive(Debug, Clone, Pread, SizeWith)]
+#[derive(Debug, Clone, Pread, Pwrite, SizeWith)]
 pub struct MINIDUMP_MEMORY_INFO_LIST {
     /// The size of this header
     pub size_of_header: u32,
@@ -1832,7 +1837,7 @@ pub struct MINIDUMP_MEMORY_INFO_LIST {
 /// This struct matches the [Microsoft struct][msdn] of the same name.
 ///
 /// [msdn]: https://docs.microsoft.com/en-us/windows/win32/api/minidumpapiset/ns-minidumpapiset-minidump_memory_info
-#[derive(Debug, Clone, PartialEq, Eq, Pread, SizeWith)]
+#[derive(Debug, Clone, PartialEq, Eq, Pread, Pwrite, SizeWith)]
 pub struct MINIDUMP_MEMORY_INFO {
     /// The base address of the region of pages
     pub base_address: u64,
@@ -1931,7 +1936,7 @@ bitflags! {
 /// Taken from the definition in Breakpad's [minidump_format.h][fmt].
 ///
 /// [fmt]: https://chromium.googlesource.com/breakpad/breakpad/+/88d8114fda3e4a7292654bd6ac0c34d6c88a8121/src/google_breakpad/common/minidump_format.h#998
-#[derive(Debug, Clone, Pread, SizeWith)]
+#[derive(Debug, Clone, Pread, Pwrite, SizeWith)]
 pub struct MINIDUMP_ASSERTION_INFO {
     /// The assertion that failed, as a 0-terminated UTF16-LE string
     pub expression: [u16; 128],
@@ -2056,7 +2061,7 @@ impl<'a> scroll::ctx::TryFromCtx<'a, Endian> for MINIDUMP_UTF8_STRING {
 /// A key-value pair.
 ///
 /// See <https://crashpad.chromium.org/doxygen/structcrashpad_1_1MinidumpSimpleStringDictionaryEntry.html>
-#[derive(Clone, Debug, Pread, SizeWith)]
+#[derive(Clone, Debug, Pread, Pwrite, SizeWith)]
 pub struct MINIDUMP_SIMPLE_STRING_DICTIONARY_ENTRY {
     /// RVA of a MinidumpUTF8String containing the key of a key-value pair.
     pub key: RVA,
@@ -2067,7 +2072,7 @@ pub struct MINIDUMP_SIMPLE_STRING_DICTIONARY_ENTRY {
 /// A list of key-value pairs.
 ///
 /// See <https://crashpad.chromium.org/doxygen/structcrashpad_1_1MinidumpSimpleStringDictionary.html>
-#[derive(Clone, Debug, Pread)]
+#[derive(Clone, Debug, Pread, Pwrite, SizeWith)]
 pub struct MINIDUMP_SIMPLE_STRING_DICTIONARY {
     /// The number of key-value pairs present.
     pub count: u32,
@@ -2076,7 +2081,7 @@ pub struct MINIDUMP_SIMPLE_STRING_DICTIONARY {
 /// A list of RVA pointers.
 ///
 /// See <https://crashpad.chromium.org/doxygen/structcrashpad_1_1MinidumpRVAList.html>
-#[derive(Clone, Debug, Pread)]
+#[derive(Clone, Debug, Pread, Pwrite, SizeWith)]
 pub struct MINIDUMP_RVA_LIST {
     /// The number of pointers present.
     pub count: u32,
@@ -2085,7 +2090,7 @@ pub struct MINIDUMP_RVA_LIST {
 /// A typed annotation object.
 ///
 /// See <https://crashpad.chromium.org/doxygen/structcrashpad_1_1MinidumpAnnotation.html>
-#[derive(Clone, Debug, Pread)]
+#[derive(Clone, Debug, Pread, Pwrite, SizeWith)]
 pub struct MINIDUMP_ANNOTATION {
     /// RVA of a MinidumpUTF8String containing the name of the annotation.
     pub name: RVA,
@@ -2126,7 +2131,7 @@ impl MINIDUMP_ANNOTATION {
 /// or not.
 ///
 /// See <https://crashpad.chromium.org/doxygen/structcrashpad_1_1MinidumpModuleCrashpadInfo.html>
-#[derive(Clone, Debug, Pread)]
+#[derive(Clone, Debug, Pread, Pwrite, SizeWith)]
 pub struct MINIDUMP_MODULE_CRASHPAD_INFO {
     /// The structure’s version number.
     ///
@@ -2173,7 +2178,7 @@ impl MINIDUMP_MODULE_CRASHPAD_INFO {
 /// module carried within a minidump file.
 ///
 /// See <https://crashpad.chromium.org/doxygen/structcrashpad_1_1MinidumpModuleCrashpadInfoLink.html>
-#[derive(Clone, Debug, Pread, SizeWith)]
+#[derive(Clone, Debug, Pread, Pwrite, SizeWith)]
 pub struct MINIDUMP_MODULE_CRASHPAD_INFO_LINK {
     /// A link to a MINIDUMP_MODULE structure in the module list stream.
     ///
@@ -2201,7 +2206,7 @@ pub struct MINIDUMP_MODULE_CRASHPAD_INFO_LINK {
 /// `MinidumpModuleCrashpadInfo` structure.
 ///
 /// See <https://crashpad.chromium.org/doxygen/structcrashpad_1_1MinidumpModuleCrashpadInfoList.html>
-#[derive(Clone, Debug, Pread)]
+#[derive(Clone, Debug, Pread, Pwrite, SizeWith)]
 pub struct MINIDUMP_MODULE_CRASHPAD_INFO_LIST {
     /// The number of key-value pairs present.
     pub count: u32,
@@ -2216,7 +2221,7 @@ pub struct MINIDUMP_MODULE_CRASHPAD_INFO_LIST {
 /// or not.
 ///
 /// See <https://crashpad.chromium.org/doxygen/structcrashpad_1_1MinidumpCrashpadInfo.html>
-#[derive(Clone, Debug, Pread, SizeWith)]
+#[derive(Clone, Debug, Pread, Pwrite, SizeWith)]
 pub struct MINIDUMP_CRASHPAD_INFO {
     /// The structure’s version number.
     ///
@@ -2259,7 +2264,7 @@ impl MINIDUMP_CRASHPAD_INFO {
 ///
 /// This is the format of the [`MINIDUMP_STREAM_TYPE::MozMacosCrashInfoStream`]. The individual
 /// [`MINIDUMP_MAC_CRASH_INFO_RECORD`] entries follow this header in the stream.
-#[derive(Debug, Pread, SizeWith)]
+#[derive(Debug, Pread, Pwrite, SizeWith)]
 pub struct MINIDUMP_MAC_CRASH_INFO {
     pub stream_type: u32,
     /// The number of [`MINIDUMP_MAC_CRASH_INFO_RECORD`]s.
@@ -2403,6 +2408,13 @@ pub const MAC_CRASH_INFO_STRING_MAX_SIZE: usize = 8192;
 /// sections per process. But the __crash_info section is almost entirely
 /// undocumented, so just in case we set a large maximum.
 pub const MAC_CRASH_INFOS_MAX: usize = 20;
+
+/// MacOS kernel boot args
+#[derive(Debug, Clone, Pread, Pwrite, SizeWith)]
+pub struct MINIDUMP_MAC_BOOTARGS {
+    pub stream_type: u32,
+    pub bootargs: RVA64,
+}
 
 bitflags! {
     /// Possible values of [`ARMCpuInfo::elf_hwcaps`]

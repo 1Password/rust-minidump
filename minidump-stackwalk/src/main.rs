@@ -13,9 +13,11 @@ use std::{boxed::Box, path::PathBuf};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use minidump::*;
 use minidump_processor::{
-    http_symbol_supplier, simple_symbol_supplier, MultiSymbolProvider,
-    PendingProcessorStatSubscriptions, PendingProcessorStats, ProcessorOptions, SymbolProvider,
-    Symbolizer,
+    PendingProcessorStatSubscriptions, PendingProcessorStats, ProcessorOptions,
+};
+use minidump_unwind::{
+    debuginfo::DebugInfoSymbolProvider, http_symbol_supplier, simple_symbol_supplier,
+    MultiSymbolProvider, SymbolProvider, Symbolizer,
 };
 
 use clap::{
@@ -34,9 +36,9 @@ use tracing::level_filters::LevelFilter;
 /// Symbols are used for two purposes:
 ///
 ///  1. To fill in more information about each frame of the backtraces. (function names, lines, etc.)
-///  2. To do produce a more *accurate* backtrace. This is primarily accomplished with
-///     call frame information (CFI), but just knowing what parts of a module maps to actual
-///     code is also useful!
+///  2. To produce a more *accurate* backtrace. This is primarily accomplished with call frame
+///     information (CFI), but just knowing what parts of a module maps to actual code is also
+///     useful!
 ///
 /// Supported Symbol Formats:
 ///
@@ -195,6 +197,10 @@ struct Cli {
     #[arg(long)]
     recover_function_args: bool,
 
+    /// Use debug information from local files referred to by the minidump, if present.
+    #[arg(long)]
+    use_local_debuginfo: bool,
+
     /// base URL from which URLs to symbol files can be constructed
     ///
     /// If multiple symbols-url values are provided, they will each be tried in order until
@@ -264,14 +270,25 @@ struct Cli {
     symbols_path_legacy: Vec<PathBuf>,
 }
 
-#[cfg_attr(test, allow(dead_code))]
 #[tokio::main]
 async fn main() {
+    if let Err(e) = main_result().await {
+        // Ignore broken pipe errors, they will only occur from stdio, typically when a user is
+        // piping into another program but that program doesn't read all input.
+        if e.kind() != std::io::ErrorKind::BrokenPipe {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+async fn main_result() -> std::io::Result<()> {
     let cli = Cli::parse();
 
     // Init the logger (and make trace logging less noisy)
     if let Some(log_path) = &cli.log_file {
-        let log_file = File::create(log_path).unwrap();
+        let log_file = File::create(log_path)?;
         tracing_subscriber::fmt::fmt()
             .with_max_level(cli.verbose)
             .with_target(false)
@@ -317,7 +334,7 @@ async fn main() {
     // of our public API.
     if cli.help_markdown {
         print_help_markdown(&mut std::io::stdout()).expect("help-markdown failed");
-        return;
+        return Ok(());
     }
 
     let temp_dir = std::env::temp_dir();
@@ -391,10 +408,10 @@ async fn main() {
         Ok(dump) => {
             let mut stdout;
             let mut output_f;
-            let cyborg_output_f = cli.cyborg.map(|path| File::create(path).unwrap());
+            let cyborg_output_f = cli.cyborg.map(File::create).transpose()?;
 
             let mut output: &mut dyn Write = if let Some(output_path) = cli.output_file {
-                output_f = File::create(output_path).unwrap();
+                output_f = File::create(output_path)?;
                 &mut output_f
             } else {
                 stdout = std::io::stdout();
@@ -403,10 +420,14 @@ async fn main() {
 
             // minidump_dump mode
             if raw_dump {
-                return print_minidump_dump(&dump, &mut output, cli.brief).unwrap();
+                return print_minidump_dump(&dump, &mut output, cli.brief);
             }
 
             let mut provider = MultiSymbolProvider::new();
+
+            if cli.use_local_debuginfo {
+                provider.add(Box::<DebugInfoSymbolProvider>::default());
+            }
 
             if !cli.symbols_url.is_empty() {
                 provider.add(Box::new(Symbolizer::new(http_symbol_supplier(
@@ -461,20 +482,21 @@ async fn main() {
                     // Print the human output if requested (always uses the "real" output).
                     if human {
                         if cli.brief {
-                            state.print_brief(&mut output).unwrap();
+                            state.print_brief(&mut output)?;
                         } else {
-                            state.print(&mut output).unwrap();
+                            state.print(&mut output)?;
                         }
                     }
 
                     // Print the json output if requested (using "cyborg" output if available).
                     if json {
                         if let Some(mut cyborg_output_f) = cyborg_output_f {
-                            state.print_json(&mut cyborg_output_f, cli.pretty).unwrap();
+                            state.print_json(&mut cyborg_output_f, cli.pretty)?;
                         } else {
-                            state.print_json(&mut output, cli.pretty).unwrap();
+                            state.print_json(&mut output, cli.pretty)?;
                         }
                     }
+                    Ok(())
                 }
                 Err(err) => {
                     error!("{} - Error processing dump: {}", err.name(), err);
@@ -489,7 +511,7 @@ async fn main() {
     }
 }
 
-fn print_help_markdown(out: &mut dyn Write) -> Result<(), Box<dyn std::error::Error>> {
+fn print_help_markdown(out: &mut dyn Write) -> std::io::Result<()> {
     let app_name = "minidump-stackwalk";
     let pretty_app_name = "minidump-stackwalk";
     // Make a new App to get the help message this time.
@@ -498,7 +520,7 @@ fn print_help_markdown(out: &mut dyn Write) -> Result<(), Box<dyn std::error::Er
     writeln!(out)?;
     writeln!(
         out,
-        "> This manual can be regenerated with `{pretty_app_name} --help-markdown`"
+        "> This manual can be regenerated with `{pretty_app_name} --help-markdown please`"
     )?;
     writeln!(out)?;
 
@@ -510,7 +532,7 @@ fn print_help_markdown(out: &mut dyn Write) -> Result<(), Box<dyn std::error::Er
 
     while let Some(command) = todo.pop() {
         let mut help_buf = Vec::new();
-        command.write_long_help(&mut help_buf).unwrap();
+        command.write_long_help(&mut help_buf)?;
         let help = String::from_utf8(help_buf).unwrap();
 
         // First line is --version
@@ -628,14 +650,18 @@ where
 
     // Other streams depend on these, so load them upfront.
     let system_info = dump.get_stream::<MinidumpSystemInfo>().ok();
-    let memory_list = dump.get_stream::<MinidumpMemoryList<'_>>().ok();
-    let memory64_list = dump.get_stream::<MinidumpMemory64List<'_>>().ok();
+    let mut memory_list = dump.get_stream::<MinidumpMemoryList<'_>>().ok();
+    let mut memory64_list = dump.get_stream::<MinidumpMemory64List<'_>>().ok();
     let misc_info = dump.get_stream::<MinidumpMiscInfo>().ok();
 
+    let unified_memory = memory64_list
+        .take()
+        .map(UnifiedMemoryList::Memory64)
+        .or_else(|| memory_list.take().map(UnifiedMemoryList::Memory));
     if let Ok(thread_list) = dump.get_stream::<MinidumpThreadList<'_>>() {
         thread_list.print(
             output,
-            memory_list.as_ref(),
+            unified_memory.as_ref(),
             system_info.as_ref(),
             misc_info.as_ref(),
             brief,
@@ -646,6 +672,9 @@ where
     }
     if let Ok(module_list) = dump.get_stream::<MinidumpUnloadedModuleList>() {
         module_list.print(output)?;
+    }
+    if let Some(memory_list) = unified_memory {
+        memory_list.print(output, brief)?;
     }
     if let Some(memory_list) = memory_list {
         memory_list.print(output, brief)?;
@@ -682,6 +711,9 @@ where
     if let Ok(mac_info) = dump.get_stream::<MinidumpMacCrashInfo>() {
         mac_info.print(output)?;
     }
+    if let Ok(mac_bootargs) = dump.get_stream::<MinidumpMacBootargs>() {
+        mac_bootargs.print(output)?;
+    }
 
     // Handle Linux streams that are just a dump of some system "file".
     macro_rules! streams {
@@ -690,13 +722,13 @@ where
         };
     }
     fn print_raw_stream<T: Write>(name: &str, contents: &[u8], out: &mut T) -> std::io::Result<()> {
-        writeln!(out, "Stream {}:", name)?;
+        writeln!(out, "Stream {name}:")?;
         let s = contents
             .split(|&v| v == 0)
             .map(String::from_utf8_lossy)
             .collect::<Vec<_>>()
             .join("\\0\n");
-        write!(out, "{}\n\n", s)
+        write!(out, "{s}\n\n")
     }
 
     for &(stream, name) in streams!(

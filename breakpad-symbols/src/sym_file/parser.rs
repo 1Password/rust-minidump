@@ -3,7 +3,7 @@
 
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_while};
-use nom::character::complete::{hex_digit1, space1};
+use nom::character::complete::{hex_digit1, multispace0, space1};
 use nom::character::{is_digit, is_hex_digit};
 use nom::combinator::{cut, map, map_res, opt};
 use nom::error::{Error, ErrorKind, ParseError};
@@ -384,17 +384,20 @@ fn stack_cfi_init(input: &[u8]) -> IResult<&[u8], StackInfoCfi> {
 
 // Parse any of the line data that can occur in the body of a symbol file.
 fn line(input: &[u8]) -> IResult<&[u8], Line> {
-    alt((
-        map(info_url, Line::Info),
-        map(info_line, |_| Line::Info(Info::Unknown)),
-        map(file_line, |(i, f)| Line::File(i, f)),
-        map(inline_origin_line, |(i, f)| Line::InlineOrigin(i, f)),
-        map(public_line, Line::Public),
-        map(func_line, |f| Line::Function(f, Vec::new(), Vec::new())),
-        map(stack_win_line, Line::StackWin),
-        map(stack_cfi_init, Line::StackCfi),
-        map(module_line, |_| Line::Module),
-    ))(input)
+    terminated(
+        alt((
+            map(info_url, Line::Info),
+            map(info_line, |_| Line::Info(Info::Unknown)),
+            map(file_line, |(i, f)| Line::File(i, f)),
+            map(inline_origin_line, |(i, f)| Line::InlineOrigin(i, f)),
+            map(public_line, Line::Public),
+            map(func_line, |f| Line::Function(f, Vec::new(), Vec::new())),
+            map(stack_win_line, Line::StackWin),
+            map(stack_cfi_init, Line::StackCfi),
+            map(module_line, |_| Line::Module),
+        )),
+        multispace0,
+    )(input)
 }
 
 /// A parser for SymbolFiles.
@@ -719,7 +722,7 @@ fn into_rangemap_safe<V: Clone + Eq + Debug>(mut input: Vec<(Range<u64>, V)>) ->
         }
         vec.push((range, val));
     }
-    RangeMap::from_sorted_vec(vec)
+    RangeMap::try_from_iter(vec).unwrap()
 }
 
 #[cfg(test)]
@@ -1108,7 +1111,7 @@ fn test_stack_win_line_program_string() {
                 )
             );
         }
-        Err(e) => panic!("{}", format!("Parse error: {:?}", e)),
+        Err(e) => panic!("{}", format!("Parse error: {e:?}")),
         _ => panic!("Something bad happened"),
     }
 }
@@ -1132,7 +1135,7 @@ fn test_stack_win_line_frame_data() {
                 WinStackThing::AllocatesBasePointer(true)
             );
         }
-        Err(e) => panic!("{}", format!("Parse error: {:?}", e)),
+        Err(e) => panic!("{}", format!("Parse error: {e:?}")),
         _ => panic!("Something bad happened"),
     }
 }
@@ -1223,6 +1226,7 @@ STACK CFI INIT badf00d abc init rules
 STACK CFI deadf00d some rules
 STACK CFI deadbeef more rules
 STACK CFI INIT f00f f0 more init rules
+
 "[..];
     let sym = parse_symbol_bytes(bytes).unwrap();
     assert_eq!(sym.files.len(), 2);
@@ -1245,7 +1249,7 @@ STACK CFI INIT f00f f0 more init rules
     let funcs = sym
         .functions
         .ranges_values()
-        .map(|&(_, ref f)| f)
+        .map(|(_, f)| f)
         .collect::<Vec<_>>();
     {
         let f = &funcs[0];
@@ -1306,7 +1310,7 @@ STACK CFI INIT f00f f0 more init rules
     let ws = sym
         .win_stack_framedata_info
         .ranges_values()
-        .map(|&(_, ref s)| s)
+        .map(|(_, s)| s)
         .collect::<Vec<_>>();
     {
         let stack = &ws[0];
@@ -1327,7 +1331,7 @@ STACK CFI INIT f00f f0 more init rules
     let ws = sym
         .win_stack_fpo_info
         .ranges_values()
-        .map(|&(_, ref s)| s)
+        .map(|(_, s)| s)
         .collect::<Vec<_>>();
     {
         let stack = &ws[0];
@@ -1348,7 +1352,7 @@ STACK CFI INIT f00f f0 more init rules
     let cs = sym
         .cfi_stack_info
         .ranges_values()
-        .map(|&(_, ref s)| s.clone())
+        .map(|(_, s)| s.clone())
         .collect::<Vec<_>>();
     assert_eq!(
         cs[0],
@@ -1420,7 +1424,7 @@ FUNC 1001 10 10 some func overlap contained
     let funcs = sym
         .functions
         .ranges_values()
-        .map(|&(_, ref f)| f)
+        .map(|(_, f)| f)
         .collect::<Vec<_>>();
     {
         let f = &funcs[0];
@@ -1547,7 +1551,7 @@ STACK WIN 4 8d93e 4 4 0 0 10 0 0 1 prog string
     let ws = sym
         .win_stack_framedata_info
         .ranges_values()
-        .map(|&(_, ref s)| s)
+        .map(|(_, s)| s)
         .collect::<Vec<_>>();
     {
         let stack = &ws[0];
@@ -1568,7 +1572,7 @@ STACK WIN 4 8d93e 4 4 0 0 10 0 0 1 prog string
     let ws = sym
         .win_stack_fpo_info
         .ranges_values()
-        .map(|&(_, ref s)| s)
+        .map(|(_, s)| s)
         .collect::<Vec<_>>();
     {
         let stack = &ws[0];

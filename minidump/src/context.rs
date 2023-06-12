@@ -1062,7 +1062,7 @@ impl MinidumpContext {
                     .gread_with(&mut offset, endian)
                     .or(Err(ContextError::ReadFailure))?;
 
-                let flags = ContextFlagsCpu::from_flags(ctx.context_flags as u32);
+                let flags = ContextFlagsCpu::from_flags(ctx.context_flags);
                 if flags == ContextFlagsCpu::CONTEXT_X86 {
                     if ctx.context_flags & md::CONTEXT_HAS_XSTATE != 0 {
                         // FIXME: uses MISC_INFO_5 to parse out extra sections here
@@ -1078,7 +1078,7 @@ impl MinidumpContext {
                     .gread_with(&mut offset, endian)
                     .or(Err(ContextError::ReadFailure))?;
 
-                let flags = ContextFlagsCpu::from_flags(ctx.context_flags as u32);
+                let flags = ContextFlagsCpu::from_flags(ctx.context_flags);
                 if flags == ContextFlagsCpu::CONTEXT_AMD64 {
                     if ctx.context_flags & md::CONTEXT_HAS_XSTATE != 0 {
                         // FIXME: uses MISC_INFO_5 to parse out extra sections here
@@ -1094,7 +1094,7 @@ impl MinidumpContext {
                     .gread_with(&mut offset, endian)
                     .or(Err(ContextError::ReadFailure))?;
 
-                let flags = ContextFlagsCpu::from_flags(ctx.context_flags as u32);
+                let flags = ContextFlagsCpu::from_flags(ctx.context_flags);
                 if flags == ContextFlagsCpu::CONTEXT_PPC {
                     Ok(MinidumpContext::from_raw(MinidumpRawContext::Ppc(ctx)))
                 } else {
@@ -1118,7 +1118,7 @@ impl MinidumpContext {
                     .gread_with(&mut offset, endian)
                     .or(Err(ContextError::ReadFailure))?;
 
-                let flags = ContextFlagsCpu::from_flags(ctx.context_flags as u32);
+                let flags = ContextFlagsCpu::from_flags(ctx.context_flags);
                 if flags == ContextFlagsCpu::CONTEXT_SPARC {
                     Ok(MinidumpContext::from_raw(MinidumpRawContext::Sparc(ctx)))
                 } else {
@@ -1130,7 +1130,7 @@ impl MinidumpContext {
                     .gread_with(&mut offset, endian)
                     .or(Err(ContextError::ReadFailure))?;
 
-                let flags = ContextFlagsCpu::from_flags(ctx.context_flags as u32);
+                let flags = ContextFlagsCpu::from_flags(ctx.context_flags);
                 if flags == ContextFlagsCpu::CONTEXT_ARM {
                     Ok(MinidumpContext::from_raw(MinidumpRawContext::Arm(ctx)))
                 } else {
@@ -1142,7 +1142,7 @@ impl MinidumpContext {
                     .gread_with(&mut offset, endian)
                     .or(Err(ContextError::ReadFailure))?;
 
-                let flags = ContextFlagsCpu::from_flags(ctx.context_flags as u32);
+                let flags = ContextFlagsCpu::from_flags(ctx.context_flags);
                 if flags == ContextFlagsCpu::CONTEXT_ARM64 {
                     Ok(MinidumpContext::from_raw(MinidumpRawContext::Arm64(ctx)))
                 } else {
@@ -1166,7 +1166,7 @@ impl MinidumpContext {
                     .gread_with(&mut offset, endian)
                     .or(Err(ContextError::ReadFailure))?;
 
-                let flags = ContextFlagsCpu::from_flags(ctx.context_flags as u32);
+                let flags = ContextFlagsCpu::from_flags(ctx.context_flags);
                 if flags == ContextFlagsCpu::CONTEXT_MIPS {
                     Ok(MinidumpContext::from_raw(MinidumpRawContext::Mips(ctx)))
                 } else {
@@ -1381,6 +1381,25 @@ impl MinidumpContext {
         })
     }
 
+    /// Get the size (in bytes) of general-purpose registers.
+    pub fn register_size(&self) -> usize {
+        fn get<T: CpuContext>(_: &T) -> usize {
+            std::mem::size_of::<T::Register>()
+        }
+
+        match &self.raw {
+            MinidumpRawContext::X86(ctx) => get(ctx),
+            MinidumpRawContext::Ppc(ctx) => get(ctx),
+            MinidumpRawContext::Ppc64(ctx) => get(ctx),
+            MinidumpRawContext::Amd64(ctx) => get(ctx),
+            MinidumpRawContext::Sparc(ctx) => get(ctx),
+            MinidumpRawContext::Arm(ctx) => get(ctx),
+            MinidumpRawContext::Arm64(ctx) => get(ctx),
+            MinidumpRawContext::OldArm64(ctx) => get(ctx),
+            MinidumpRawContext::Mips(ctx) => get(ctx),
+        }
+    }
+
     /// Write a human-readable description of this `MinidumpContext` to `f`.
     ///
     /// This is very verbose, it is the format used by `minidump_dump`.
@@ -1567,7 +1586,7 @@ impl MinidumpContext {
                     raw.context_flags
                 )?;
                 for (i, reg) in raw.iregs.iter().enumerate() {
-                    writeln!(f, "  iregs[{:2}]            = {:#x}", i, reg)?;
+                    writeln!(f, "  iregs[{i:2}]            = {reg:#x}")?;
                 }
                 write!(
                     f,
@@ -1577,10 +1596,10 @@ impl MinidumpContext {
                     raw.cpsr, raw.float_save.fpscr
                 )?;
                 for (i, reg) in raw.float_save.regs.iter().enumerate() {
-                    writeln!(f, "  float_save.regs[{:2}] = {:#x}", i, reg)?;
+                    writeln!(f, "  float_save.regs[{i:2}] = {reg:#x}")?;
                 }
                 for (i, reg) in raw.float_save.extra.iter().enumerate() {
-                    writeln!(f, "  float_save.extra[{:2}] = {:#x}", i, reg)?;
+                    writeln!(f, "  float_save.extra[{i:2}] = {reg:#x}")?;
                 }
             }
             MinidumpRawContext::Arm64(ref raw) => {
@@ -1592,7 +1611,7 @@ impl MinidumpContext {
                     raw.context_flags
                 )?;
                 for (i, reg) in raw.iregs[..29].iter().enumerate() {
-                    writeln!(f, "  x{:<2}                  = {:#x}", i, reg)?;
+                    writeln!(f, "  x{i:<2}                  = {reg:#x}")?;
                 }
                 writeln!(f, "  x29 (fp)             = {:#x}", raw.iregs[29])?;
                 writeln!(f, "  x30 (lr)             = {:#x}", raw.iregs[30])?;
@@ -1602,19 +1621,19 @@ impl MinidumpContext {
                 writeln!(f, "  fpsr                 = {:#x}", raw.fpsr)?;
                 writeln!(f, "  fpcr                 = {:#x}", raw.fpcr)?;
                 for (i, reg) in raw.float_regs.iter().enumerate() {
-                    writeln!(f, "  d{:<2} = {:#x}", i, reg)?;
+                    writeln!(f, "  d{i:<2} = {reg:#x}")?;
                 }
                 for (i, reg) in raw.bcr.iter().enumerate() {
-                    writeln!(f, "  bcr[{:2}] = {:#x}", i, reg)?;
+                    writeln!(f, "  bcr[{i:2}] = {reg:#x}")?;
                 }
                 for (i, reg) in raw.bvr.iter().enumerate() {
-                    writeln!(f, "  bvr[{:2}] = {:#x}", i, reg)?;
+                    writeln!(f, "  bvr[{i:2}] = {reg:#x}")?;
                 }
                 for (i, reg) in raw.wcr.iter().enumerate() {
-                    writeln!(f, "  wcr[{:2}] = {:#x}", i, reg)?;
+                    writeln!(f, "  wcr[{i:2}] = {reg:#x}")?;
                 }
                 for (i, reg) in raw.wvr.iter().enumerate() {
-                    writeln!(f, "  wvr[{:2}] = {:#x}", i, reg)?;
+                    writeln!(f, "  wvr[{i:2}] = {reg:#x}")?;
                 }
             }
             MinidumpRawContext::OldArm64(ref raw) => {
@@ -1626,7 +1645,7 @@ impl MinidumpContext {
                     raw.context_flags
                 )?;
                 for (i, reg) in raw.iregs[..29].iter().enumerate() {
-                    writeln!(f, "  x{:<2}                  = {:#x}", i, reg)?;
+                    writeln!(f, "  x{i:<2}                  = {reg:#x}")?;
                 }
                 writeln!(f, "  x29 (fp)             = {:#x}", raw.iregs[29])?;
                 writeln!(f, "  x30 (lr)             = {:#x}", raw.iregs[30])?;
@@ -1636,7 +1655,7 @@ impl MinidumpContext {
                 writeln!(f, "  fpsr                 = {:#x}", raw.fpsr)?;
                 writeln!(f, "  fpcr                 = {:#x}", raw.fpcr)?;
                 for (i, reg) in raw.float_regs.iter().enumerate() {
-                    writeln!(f, "  d{:<2} = {:#x}", i, reg)?;
+                    writeln!(f, "  d{i:<2} = {reg:#x}")?;
                 }
             }
             MinidumpRawContext::Mips(ref raw) => {

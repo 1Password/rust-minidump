@@ -4,11 +4,8 @@
 // NOTE: we don't bother testing arm64_old, it should have identical code at
 // all times!
 
-use crate::stackwalker::walk_stack;
-use crate::{process_state::*, ProcessorOptions};
-use crate::{string_symbol_supplier, Symbolizer, SystemInfo};
+use crate::*;
 use minidump::system_info::{Cpu, Os};
-use minidump::*;
 use std::collections::HashMap;
 use test_assembler::*;
 
@@ -86,14 +83,12 @@ impl TestFixture {
             cpu_count: 1,
         };
         let symbolizer = Symbolizer::new(string_symbol_supplier(self.symbols.clone()));
-        let options = ProcessorOptions::default();
         let mut stack = CallStack::with_context(context);
 
         walk_stack(
-            0,
-            &options,
+            (),
             &mut stack,
-            Some(&stack_memory),
+            Some(UnifiedMemory::Memory(&stack_memory)),
             &self.modules,
             &system_info,
             &symbolizer,
@@ -855,8 +850,7 @@ async fn check_cfi(
                     assert_eq!(
                         ctx.get_register(reg, valid),
                         expected.get_register(reg, &expected_valid),
-                        "{} registers didn't match!",
-                        reg
+                        "{reg} registers didn't match!"
                     );
                 }
                 return;
@@ -1162,7 +1156,7 @@ async fn test_frame_pointer_overflow() {
     let mut f = TestFixture::new();
     let mut stack = Section::new();
     let stack_start: Pointer = stack_max - stack_size;
-    stack.start().set_const(stack_start as u64);
+    stack.start().set_const(stack_start);
 
     stack = stack
         // frame 0
@@ -1199,7 +1193,7 @@ async fn test_frame_pointer_barely_no_overflow() {
 
     let stack_start: Pointer = stack_max - stack_size;
     let return_address: Pointer = 0x00007500b0000110;
-    stack.start().set_const(stack_start as u64);
+    stack.start().set_const(stack_start);
 
     let frame0_fp = Label::new();
     let frame1_sp = Label::new();

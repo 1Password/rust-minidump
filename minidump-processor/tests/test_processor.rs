@@ -5,9 +5,9 @@ use minidump::system_info::{Cpu, Os};
 use minidump::{
     Error, Minidump, MinidumpContext, MinidumpContextValidity, MinidumpRawContext, Module,
 };
-use minidump_processor::{
-    simple_symbol_supplier, CallStackInfo, FrameTrust, LinuxStandardBase, ProcessState, Symbolizer,
-};
+use minidump_common::format::MemoryProtection;
+use minidump_processor::{LinuxStandardBase, ProcessState};
+use minidump_unwind::{simple_symbol_supplier, CallStackInfo, FrameTrust, Symbolizer};
 use std::path::{Path, PathBuf};
 
 use minidump_synth::*;
@@ -34,13 +34,13 @@ fn locate_testdata() -> PathBuf {
 
 fn read_test_minidump() -> Result<Minidump<'static, memmap2::Mmap>, Error> {
     let path = locate_testdata().join("test.dmp");
-    println!("minidump: {:?}", path);
+    println!("minidump: {path:?}");
     Minidump::read_path(&path)
 }
 
 fn testdata_symbol_path() -> PathBuf {
     let path = locate_testdata().join("symbols");
-    println!("symbol path: {:?}", path);
+    println!("symbol path: {path:?}");
     path
 }
 
@@ -60,7 +60,7 @@ async fn test_processor() {
     // TODO:
     // assert_eq!(state.system_info.cpu_info.unwrap(),
     // "GenuineIntel family 6 model 13 stepping 8");
-    assert_eq!(state.exception_info.unwrap().address, 0x45);
+    assert_eq!(state.exception_info.unwrap().address.0, 0x45);
     assert_eq!(state.threads.len(), 2);
     assert_eq!(state.requesting_thread.unwrap(), 0);
 
@@ -119,7 +119,7 @@ async fn test_processor() {
 async fn test_processor_symbols() {
     let dump = read_test_minidump().unwrap();
     let path = testdata_symbol_path();
-    println!("symbol path: {:?}", path);
+    println!("symbol path: {path:?}");
     let state = minidump_processor::process_minidump(
         &dump,
         &Symbolizer::new(simple_symbol_supplier(vec![path])),
@@ -267,4 +267,146 @@ async fn test_no_frames() {
     state.threads[0].frames.clear();
 
     state.print_json(&mut std::io::sink(), true).unwrap();
+}
+
+#[tokio::test]
+async fn test_bit_flip() {
+    let context = minidump_synth::amd64_context(Endian::Little, 0, 0);
+
+    let stack = Memory::with_section(Section::with_endian(Endian::Little), 0);
+    let heap_info = MemoryInfo::new(Endian::Little, 0x80000, 0x80000, 0, 8, 0, 0, 0);
+
+    let thread = Thread::new(Endian::Little, 1, &stack, &context);
+    let system_info = SystemInfo::new(Endian::Little).set_processor_architecture(
+        minidump_common::format::ProcessorArchitecture::PROCESSOR_ARCHITECTURE_AMD64 as u16,
+    );
+
+    let mut ex = Exception::new(Endian::Little);
+    ex.thread_id = 1;
+    ex.exception_record.exception_address = 0x80400;
+
+    let dump = SynthMinidump::with_endian(Endian::Little)
+        .add_thread(thread)
+        .add_exception(ex)
+        .add_system_info(system_info)
+        .add(context)
+        .add_memory(stack)
+        .add_memory_info(heap_info);
+
+    let state = read_synth_dump(dump).await;
+
+    let bit_flips = state
+        .exception_info
+        .expect("missing exception info")
+        .possible_bit_flips;
+
+    assert_eq!(bit_flips.len(), 1);
+    let bf = bit_flips.into_iter().next().unwrap();
+    assert_eq!(bf.address.0, 0x80000);
+    assert_eq!(bf.details, Default::default());
+}
+
+#[tokio::test]
+async fn test_no_bit_flip_32bit() {
+    let context = minidump_synth::x86_context(Endian::Little, 0, 0);
+
+    let stack = Memory::with_section(Section::with_endian(Endian::Little), 0);
+    let heap_info = MemoryInfo::new(Endian::Little, 0x80000, 0x80000, 0, 8, 0, 0, 0);
+
+    let thread = Thread::new(Endian::Little, 1, &stack, &context);
+    let system_info = SystemInfo::new(Endian::Little);
+
+    let mut ex = Exception::new(Endian::Little);
+    ex.thread_id = 1;
+    ex.exception_record.exception_address = 0x80400;
+
+    let dump = SynthMinidump::with_endian(Endian::Little)
+        .add_thread(thread)
+        .add_exception(ex)
+        .add_system_info(system_info)
+        .add(context)
+        .add_memory(stack)
+        .add_memory_info(heap_info);
+
+    let state = read_synth_dump(dump).await;
+
+    assert!(state
+        .exception_info
+        .expect("missing exception info")
+        .possible_bit_flips
+        .is_empty());
+}
+
+#[tokio::test]
+async fn test_guard_pages() {
+    let context = minidump_synth::amd64_context(Endian::Little, 0x2000, 0x81000);
+
+    // The bytes here are the opcode `mov al, [rsp]`. We use rsp only because it's convenient to
+    // set using the `amd64_context` function.
+    let memory = Memory::with_section(
+        Section::with_endian(Endian::Little).append_bytes(&[0x8a, 0x04, 0x24]),
+        0x2000,
+    );
+    let stack = Memory::with_section(Section::with_endian(Endian::Little), 0x1000);
+    let heap_info = MemoryInfo::new(
+        Endian::Little,
+        0x80000,
+        0x80000,
+        0,
+        4096,
+        0,
+        MemoryProtection::PAGE_EXECUTE_READWRITE.bits(),
+        0,
+    );
+    let guard_page_info = MemoryInfo::new(
+        Endian::Little,
+        0x81000,
+        0x81000,
+        0,
+        4096,
+        0,
+        MemoryProtection::PAGE_NOACCESS.bits(),
+        0,
+    );
+
+    let thread = Thread::new(Endian::Little, 1, &stack, &context);
+    let system_info = SystemInfo::new(Endian::Little).set_processor_architecture(
+        minidump_common::format::ProcessorArchitecture::PROCESSOR_ARCHITECTURE_AMD64 as u16,
+    );
+
+    let context_label = context.file_offset();
+    let context_size = context.file_size();
+
+    let dump = SynthMinidump::with_endian(Endian::Little).add(context);
+
+    let mut ex = Exception::new(Endian::Little);
+    ex.thread_id = 1;
+    ex.exception_record.exception_address = 0x81000;
+    // Point the exception context at the main exception context.
+    // This is (size, offset).
+    ex.thread_context = (
+        context_size.value().unwrap() as u32,
+        context_label.value().unwrap() as u32,
+    );
+
+    let dump = dump
+        .add_thread(thread)
+        .add_exception(ex)
+        .add_system_info(system_info)
+        .add_memory(memory)
+        .add_memory(stack)
+        .add_memory_info(heap_info)
+        .add_memory_info(guard_page_info);
+
+    let state = read_synth_dump(dump).await;
+
+    let accesses = state
+        .exception_info
+        .expect("missing exception info")
+        .memory_accesses
+        .expect("no memory accesses");
+
+    assert_eq!(accesses.len(), 1);
+    assert_eq!(accesses[0].address, 0x81000);
+    assert!(accesses[0].is_likely_guard_page);
 }

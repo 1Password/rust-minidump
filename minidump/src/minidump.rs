@@ -2,8 +2,6 @@
 // file at the top-level directory of this distribution.
 
 use debugid::{CodeId, DebugId};
-use encoding::all::{UTF_16BE, UTF_16LE};
-use encoding::{DecoderTrap, Encoding};
 use memmap2::Mmap;
 use num_traits::FromPrimitive;
 use scroll::ctx::{SizeWith, TryFromCtx};
@@ -388,7 +386,13 @@ pub type MinidumpMemory<'a> = MinidumpMemoryBase<'a, md::MINIDUMP_MEMORY_DESCRIP
 /// A large region of memory from the process that wrote the minidump (usually a full dump).
 pub type MinidumpMemory64<'a> = MinidumpMemoryBase<'a, md::MINIDUMP_MEMORY_DESCRIPTOR64>;
 
-#[allow(clippy::large_enum_variant)]
+/// Provides a unified interface for MinidumpMemory and MinidumpMemory64
+#[derive(Debug, Clone, Copy)]
+pub enum UnifiedMemory<'a, 'mdmp> {
+    Memory(&'a MinidumpMemory<'mdmp>),
+    Memory64(&'a MinidumpMemory64<'mdmp>),
+}
+
 #[derive(Debug, Clone)]
 pub enum RawMacCrashInfo {
     V1(
@@ -409,6 +413,12 @@ pub enum RawMacCrashInfo {
 pub struct MinidumpMacCrashInfo {
     /// The `MINIDUMP_MAC_CRASH_INFO_RECORD` and `MINIDUMP_MAC_CRASH_INFO_RECORD_STRINGS`.
     pub raw: Vec<RawMacCrashInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MinidumpMacBootargs {
+    pub raw: md::MINIDUMP_MAC_BOOTARGS,
+    pub bootargs: Option<String>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -560,6 +570,18 @@ pub type MinidumpMemoryList<'a> = MinidumpMemoryListBase<'a, md::MINIDUMP_MEMORY
 /// A list of large memory regions included in a minidump (usually a full dump).
 pub type MinidumpMemory64List<'a> = MinidumpMemoryListBase<'a, md::MINIDUMP_MEMORY_DESCRIPTOR64>;
 
+/// Provides a unified interface for MinidumpMemoryList and MinidumpMemory64List
+#[derive(Debug)]
+pub enum UnifiedMemoryList<'a> {
+    Memory(MinidumpMemoryList<'a>),
+    Memory64(MinidumpMemory64List<'a>),
+}
+impl<'a> Default for UnifiedMemoryList<'a> {
+    fn default() -> Self {
+        Self::Memory(Default::default())
+    }
+}
+
 /// Information about an assertion that caused a crash.
 #[derive(Debug)]
 pub struct MinidumpAssertion {
@@ -660,15 +682,15 @@ fn read_string_utf16(offset: &mut usize, bytes: &[u8], endian: scroll::Endian) -
     if size % 2 != 0 || (*offset + size) > bytes.len() {
         return None;
     }
-    let encoding: &dyn Encoding = match endian {
-        scroll::Endian::Little => UTF_16LE,
-        scroll::Endian::Big => UTF_16BE,
+    let encoding = match endian {
+        scroll::Endian::Little => encoding_rs::UTF_16LE,
+        scroll::Endian::Big => encoding_rs::UTF_16BE,
     };
+
     let s = encoding
-        .decode(&bytes[*offset..*offset + size], DecoderTrap::Strict)
-        .ok()?;
+        .decode_without_bom_handling_and_without_replacement(&bytes[*offset..*offset + size])?;
     *offset += size;
-    Some(s)
+    Some(s.into())
 }
 
 #[inline]
@@ -714,7 +736,7 @@ fn string_from_bytes_nul(bytes: &[u8]) -> Option<Cow<'_, str>> {
 
 /// Format `bytes` as a String of hex digits
 fn bytes_to_hex(bytes: &[u8]) -> String {
-    let hex_bytes: Vec<String> = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    let hex_bytes: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
     hex_bytes.join("")
 }
 
@@ -1324,7 +1346,7 @@ where
     *offset += header_padding;
 
     // read count T raw stream entries
-    let mut raw_entries = Vec::with_capacity(number_of_entries as usize);
+    let mut raw_entries = Vec::with_capacity(number_of_entries);
     for _ in 0..number_of_entries {
         let raw: T = bytes
             .gread_with(offset, endian)
@@ -1384,12 +1406,11 @@ impl MinidumpThreadNames {
         for (i, (thread_id, name)) in self.names.iter().enumerate() {
             writeln!(
                 f,
-                "thread_name[{}]
+                "thread_name[{i}]
 MINIDUMP_THREAD_NAME
-  thread_id = {:#x}
-  name      = \"{}\"
-",
-                i, thread_id, name
+  thread_id = {thread_id:#x}
+  name      = \"{name}\"
+"
             )?;
         }
 
@@ -1461,7 +1482,7 @@ impl MinidumpModuleList {
             self.modules.len()
         )?;
         for (i, module) in self.modules.iter().enumerate() {
-            writeln!(f, "module[{}]", i)?;
+            writeln!(f, "module[{i}]")?;
             module.print(f)?;
         }
         Ok(())
@@ -1487,11 +1508,16 @@ impl<'a> MinidumpStream<'a> for MinidumpModuleList {
         let raw_modules: Vec<md::MINIDUMP_MODULE> = read_stream_list(&mut offset, bytes, endian)?;
         // read auxiliary data for each module
         let mut modules = Vec::with_capacity(raw_modules.len());
-        for raw in raw_modules.into_iter() {
+        for (module_index, raw) in raw_modules.into_iter().enumerate() {
             if raw.size_of_image == 0 || raw.size_of_image as u64 > (u64::MAX - raw.base_of_image) {
                 // Bad image size.
-                // TODO: just drop this module, keep the rest?
-                return Err(Error::ModuleReadFailure);
+                tracing::warn!(
+                    module_index,
+                    base = raw.base_of_image,
+                    size = raw.size_of_image,
+                    "bad module image size"
+                );
+                continue;
             }
             modules.push(MinidumpModule::read(raw, all, endian, system_info)?);
         }
@@ -1562,7 +1588,7 @@ impl MinidumpUnloadedModuleList {
             self.modules.len()
         )?;
         for (i, module) in self.modules.iter().enumerate() {
-            writeln!(f, "module[{}]", i)?;
+            writeln!(f, "module[{i}]")?;
             module.print(f)?;
         }
         Ok(())
@@ -1690,11 +1716,11 @@ impl<'a, Descriptor> MinidumpMemoryBase<'a, Descriptor> {
         const PARAGRAPH_SIZE: usize = 16;
         let mut offset = 0;
         for paragraph in self.bytes.chunks(PARAGRAPH_SIZE) {
-            write!(f, "    {:08x}: ", offset)?;
+            write!(f, "    {offset:08x}: ")?;
             let mut byte_iter = paragraph.iter().fuse();
             for _ in 0..PARAGRAPH_SIZE {
                 if let Some(byte) = byte_iter.next() {
-                    write!(f, "{:02x} ", byte)?;
+                    write!(f, "{byte:02x} ")?;
                 } else {
                     write!(f, "   ")?;
                 }
@@ -1706,7 +1732,7 @@ impl<'a, Descriptor> MinidumpMemoryBase<'a, Descriptor> {
                     char::from(byte)
                 };
 
-                write!(f, "{}", ascii_char)?;
+                write!(f, "{ascii_char}")?;
             }
             writeln!(f)?;
 
@@ -1723,6 +1749,60 @@ impl<'a, Descriptor> MinidumpMemoryBase<'a, Descriptor> {
             self.base_address,
             self.base_address.checked_add(self.size)? - 1,
         ))
+    }
+}
+
+impl<'a, 'mdmp> UnifiedMemory<'a, 'mdmp> {
+    pub fn get_memory_at_address<T>(&self, addr: u64) -> Option<T>
+    where
+        T: TryFromCtx<'mdmp, scroll::Endian, [u8], Error = scroll::Error>,
+    {
+        match self {
+            UnifiedMemory::Memory(this) => this.get_memory_at_address(addr),
+            UnifiedMemory::Memory64(this) => this.get_memory_at_address(addr),
+        }
+    }
+
+    pub fn memory_range(&self) -> Option<Range<u64>> {
+        match self {
+            UnifiedMemory::Memory(this) => this.memory_range(),
+            UnifiedMemory::Memory64(this) => this.memory_range(),
+        }
+    }
+
+    pub fn bytes(&self) -> &'a [u8] {
+        match self {
+            UnifiedMemory::Memory(this) => this.bytes,
+            UnifiedMemory::Memory64(this) => this.bytes,
+        }
+    }
+
+    pub fn base_address(&self) -> u64 {
+        match self {
+            UnifiedMemory::Memory(this) => this.base_address,
+            UnifiedMemory::Memory64(this) => this.base_address,
+        }
+    }
+
+    pub fn size(&self) -> u64 {
+        match self {
+            UnifiedMemory::Memory(this) => this.size,
+            UnifiedMemory::Memory64(this) => this.size,
+        }
+    }
+
+    pub fn print_contents<T: Write>(&self, f: &mut T) -> io::Result<()> {
+        match self {
+            UnifiedMemory::Memory(this) => this.print_contents(f),
+            UnifiedMemory::Memory64(this) => this.print_contents(f),
+        }
+    }
+
+    pub fn print<T: Write>(&self, f: &mut T, brief: bool) -> io::Result<()> {
+        match self {
+            UnifiedMemory::Memory(this) => this.print(f, brief),
+            UnifiedMemory::Memory64(this) => this.print(f, brief),
+        }
     }
 }
 
@@ -1796,7 +1876,7 @@ impl<'mdmp> MinidumpMemoryList<'mdmp> {
             self.regions.len()
         )?;
         for (i, region) in self.regions.iter().enumerate() {
-            writeln!(f, "region[{}]", i)?;
+            writeln!(f, "region[{i}]")?;
             region.print(f, brief)?;
         }
         Ok(())
@@ -1817,10 +1897,65 @@ impl<'mdmp> MinidumpMemory64List<'mdmp> {
             self.regions.len()
         )?;
         for (i, region) in self.regions.iter().enumerate() {
-            writeln!(f, "region[{}]", i)?;
+            writeln!(f, "region[{i}]")?;
             region.print(f, brief)?;
         }
         Ok(())
+    }
+}
+
+impl<'mdmp> UnifiedMemoryList<'mdmp> {
+    pub fn memory_at_address<'slf>(&'slf self, address: u64) -> Option<UnifiedMemory<'slf, 'mdmp>> {
+        match self {
+            UnifiedMemoryList::Memory(this) => {
+                this.memory_at_address(address).map(UnifiedMemory::Memory)
+            }
+            UnifiedMemoryList::Memory64(this) => {
+                this.memory_at_address(address).map(UnifiedMemory::Memory64)
+            }
+        }
+    }
+
+    pub fn iter<'slf>(&'slf self) -> impl Iterator<Item = UnifiedMemory<'slf, 'mdmp>> {
+        let iter1 = if let UnifiedMemoryList::Memory(this) = self {
+            Some(this.iter().map(UnifiedMemory::Memory))
+        } else {
+            None
+        };
+        let iter2 = if let UnifiedMemoryList::Memory64(this) = self {
+            Some(this.iter().map(UnifiedMemory::Memory64))
+        } else {
+            None
+        };
+        iter1
+            .into_iter()
+            .flatten()
+            .chain(iter2.into_iter().flatten())
+    }
+
+    /// Iterate over the memory regions in order by memory address.
+    pub fn by_addr<'slf>(&'slf self) -> impl Iterator<Item = UnifiedMemory<'slf, 'mdmp>> {
+        let iter1 = if let UnifiedMemoryList::Memory(this) = self {
+            Some(this.by_addr().map(UnifiedMemory::Memory))
+        } else {
+            None
+        };
+        let iter2 = if let UnifiedMemoryList::Memory64(this) = self {
+            Some(this.by_addr().map(UnifiedMemory::Memory64))
+        } else {
+            None
+        };
+        iter1
+            .into_iter()
+            .flatten()
+            .chain(iter2.into_iter().flatten())
+    }
+
+    pub fn print<T: Write>(&self, f: &mut T, brief: bool) -> io::Result<()> {
+        match self {
+            UnifiedMemoryList::Memory(this) => this.print(f, brief),
+            UnifiedMemoryList::Memory64(this) => this.print(f, brief),
+        }
     }
 }
 
@@ -2012,7 +2147,7 @@ impl<'mdmp> MinidumpMemoryInfoList<'mdmp> {
             self.regions.len()
         )?;
         for (i, region) in self.regions.iter().enumerate() {
-            writeln!(f, "region[{}]", i)?;
+            writeln!(f, "region[{i}]")?;
             region.print(f)?;
         }
         Ok(())
@@ -2052,6 +2187,26 @@ impl<'a> MinidumpMemoryInfo<'a> {
             self.raw.base_address,
             self.raw.base_address.checked_add(self.raw.region_size)? - 1,
         ))
+    }
+
+    /// Whether this memory range was readable.
+    pub fn is_readable(&self) -> bool {
+        self.protection.intersects(
+            md::MemoryProtection::PAGE_READONLY
+                | md::MemoryProtection::PAGE_READWRITE
+                | md::MemoryProtection::PAGE_EXECUTE_READ
+                | md::MemoryProtection::PAGE_EXECUTE_READWRITE,
+        )
+    }
+
+    /// Whether this memory range was writable.
+    pub fn is_writable(&self) -> bool {
+        self.protection.intersects(
+            md::MemoryProtection::PAGE_READWRITE
+                | md::MemoryProtection::PAGE_WRITECOPY
+                | md::MemoryProtection::PAGE_EXECUTE_READWRITE
+                | md::MemoryProtection::PAGE_EXECUTE_WRITECOPY,
+        )
     }
 
     /// Whether this memory range was executable.
@@ -2142,7 +2297,7 @@ impl<'mdmp> MinidumpLinuxMaps<'mdmp> {
             self.regions.len()
         )?;
         for (i, region) in self.regions.iter().enumerate() {
-            writeln!(f, "region[{}]", i)?;
+            writeln!(f, "region[{i}]")?;
             region.print(f)?;
         }
         Ok(())
@@ -2353,6 +2508,16 @@ impl<'a> MinidumpLinuxMapInfo<'a> {
         Some(Range::new(self.base_address, self.final_address))
     }
 
+    /// Whether this memory range was readable.
+    pub fn is_readable(&self) -> bool {
+        self.is_read
+    }
+
+    /// Whether this memory range was writable.
+    pub fn is_writable(&self) -> bool {
+        self.is_write
+    }
+
     /// Whether this memory range was executable.
     pub fn is_executable(&self) -> bool {
         self.is_exec
@@ -2461,29 +2626,39 @@ impl<'a> UnifiedMemoryInfoList<'a> {
     }
 }
 
+/// Declares functions which will forward to functions of the same name on the inner
+/// `UnifiedMemoryInfo` members.
+macro_rules! unified_memory_forward {
+    () => {};
+    ( $(#[$attr:meta])* $vis:vis fn $name:ident $(< $($t_param:ident : $t_type:path),* >)? ( &self $(, $param:ident : $type:ty)* ) -> $ret:ty ; $($rest:tt)* ) => {
+        $(#[$attr])*
+        $vis fn $name $(< $($t_param : $t_type),* >)? (&self $(, $param : $type)*) -> $ret {
+            match self {
+                Self::Info(info) => info.$name($($param),*),
+                Self::Map(map) => map.$name($($param),*),
+            }
+        }
+
+        unified_memory_forward!($($rest)*);
+    };
+}
+
 impl<'a> UnifiedMemoryInfo<'a> {
-    /// Write a human-readable description.
-    pub fn print<T: Write>(&self, f: &mut T) -> io::Result<()> {
-        match self {
-            Self::Info(info) => info.print(f),
-            Self::Map(map) => map.print(f),
-        }
-    }
+    unified_memory_forward! {
+        /// Write a human-readable description.
+        pub fn print<T: Write>(&self, f: &mut T) -> io::Result<()>;
 
-    /// The range of memory this info applies to.
-    pub fn memory_range(&self) -> Option<Range<u64>> {
-        match self {
-            Self::Info(info) => info.memory_range(),
-            Self::Map(map) => map.memory_range(),
-        }
-    }
+        /// The range of memory this info applies to.
+        pub fn memory_range(&self) -> Option<Range<u64>>;
 
-    /// Whether this memory range was executable.
-    pub fn is_executable(&self) -> bool {
-        match self {
-            Self::Info(info) => info.is_executable(),
-            Self::Map(map) => map.is_executable(),
-        }
+        /// Whether this memory range was readable.
+        pub fn is_readable(&self) -> bool;
+
+        /// Whether this memory range was writable.
+        pub fn is_writable(&self) -> bool;
+
+        /// Whether this memory range was executable.
+        pub fn is_executable(&self) -> bool;
     }
 }
 
@@ -2498,18 +2673,18 @@ impl<'a> MinidumpThread<'a> {
             .map(Cow::Owned)
     }
 
-    pub fn stack_memory(
-        &self,
-        memory_list: &MinidumpMemoryList<'a>,
-    ) -> Option<Cow<MinidumpMemory<'a>>> {
-        self.stack.as_ref().map(Cow::Borrowed).or_else(|| {
+    pub fn stack_memory<'mem>(
+        &'mem self,
+        memory_list: &'mem UnifiedMemoryList<'a>,
+    ) -> Option<UnifiedMemory<'mem, 'a>> {
+        self.stack.as_ref().map(UnifiedMemory::Memory).or_else(|| {
             // Sometimes the raw.stack RVA is null/busted, but the start_of_memory_range
             // value is correct. So if the `read` fails, try resolving start_of_memory_range
             // with the MinidumpMemoryList. (This seems to specifically be a problem with
             // Windows minidumps.)
             let stack_addr = self.raw.stack.start_of_memory_range;
             let memory = memory_list.memory_at_address(stack_addr)?;
-            Some(Cow::Owned(memory.clone()))
+            Some(memory)
         })
     }
 
@@ -2519,7 +2694,7 @@ impl<'a> MinidumpThread<'a> {
     pub fn print<T: Write>(
         &self,
         f: &mut T,
-        memory: Option<&MinidumpMemoryList<'a>>,
+        memory: Option<&UnifiedMemoryList<'a>>,
         system: Option<&MinidumpSystemInfo>,
         misc: Option<&MinidumpMiscInfo>,
         brief: bool,
@@ -2569,7 +2744,7 @@ impl<'a> MinidumpThread<'a> {
 
         // We might not need any memory, so try to limp forward with an empty
         // MemoryList if we don't have one.
-        let dummy_memory = MinidumpMemoryList::default();
+        let dummy_memory = UnifiedMemoryList::default();
         let memory = memory.unwrap_or(&dummy_memory);
         if let Some(ref stack) = self.stack_memory(memory) {
             writeln!(f, "Stack")?;
@@ -2577,8 +2752,8 @@ impl<'a> MinidumpThread<'a> {
             // For printing purposes, we'll treat any unknown CPU type as 64-bit
             let chunk_size: usize = pointer_width.size_in_bytes().unwrap_or(8).into();
             let mut offset = 0;
-            for chunk in stack.bytes.chunks_exact(chunk_size) {
-                write!(f, "    {:#010x}: ", offset)?;
+            for chunk in stack.bytes().chunks_exact(chunk_size) {
+                write!(f, "    {offset:#010x}: ")?;
 
                 match pointer_width {
                     PointerWidth::Bits32 => {
@@ -2586,14 +2761,14 @@ impl<'a> MinidumpThread<'a> {
                             scroll::Endian::Little => u32::from_le_bytes(chunk.try_into().unwrap()),
                             scroll::Endian::Big => u32::from_be_bytes(chunk.try_into().unwrap()),
                         };
-                        write!(f, "{:#010x}", value)?;
+                        write!(f, "{value:#010x}")?;
                     }
                     PointerWidth::Unknown | PointerWidth::Bits64 => {
                         let value = match self.endian {
                             scroll::Endian::Little => u64::from_le_bytes(chunk.try_into().unwrap()),
                             scroll::Endian::Big => u64::from_be_bytes(chunk.try_into().unwrap()),
                         };
-                        write!(f, "{:#018x}", value)?;
+                        write!(f, "{value:#018x}")?;
                     }
                 }
 
@@ -2613,7 +2788,7 @@ impl<'a> MinidumpThread<'a> {
     /// The value is heuristically converted into a CrashReason because that's our
     /// general error code handling machinery, even though this may not actually be
     /// the reason for the crash!
-    pub fn last_error(&self, cpu: Cpu, memory: &MinidumpMemoryList) -> Option<CrashReason> {
+    pub fn last_error(&self, cpu: Cpu, memory: &UnifiedMemoryList) -> Option<CrashReason> {
         // Early hacky implementation: rather than implementing all the TEB layouts,
         // just use the fact that we know the value we want is a 13-pointers offset
         // from the start of the TEB.
@@ -2678,7 +2853,7 @@ impl<'a> MinidumpThreadList<'a> {
     pub fn print<T: Write>(
         &self,
         f: &mut T,
-        memory: Option<&MinidumpMemoryList<'a>>,
+        memory: Option<&UnifiedMemoryList<'a>>,
         system: Option<&MinidumpSystemInfo>,
         misc: Option<&MinidumpMiscInfo>,
         brief: bool,
@@ -2693,7 +2868,7 @@ impl<'a> MinidumpThreadList<'a> {
         )?;
 
         for (i, thread) in self.threads.iter().enumerate() {
-            writeln!(f, "thread[{}]", i)?;
+            writeln!(f, "thread[{i}]")?;
             thread.print(f, memory, system, misc, brief)?;
         }
         Ok(())
@@ -2824,15 +2999,15 @@ impl<'a> MinidumpStream<'a> for MinidumpSystemInfo {
                     let part_id = cpuid & 0xff00fff0;
 
                     if let Some(&(_, vendor)) = vendors.iter().find(|&&(id, _)| id == vendor_id) {
-                        write!(&mut cpu_info, " {}", vendor).unwrap();
+                        write!(&mut cpu_info, " {vendor}").unwrap();
                     } else {
-                        write!(&mut cpu_info, " vendor({:#x})", vendor_id).unwrap();
+                        write!(&mut cpu_info, " vendor({vendor_id:#x})").unwrap();
                     }
 
                     if let Some(&(_, part)) = parts.iter().find(|&&(id, _)| id == part_id) {
-                        write!(&mut cpu_info, " {}", part).unwrap();
+                        write!(&mut cpu_info, " {part}").unwrap();
                     } else {
-                        write!(&mut cpu_info, " part({:#x})", part_id).unwrap();
+                        write!(&mut cpu_info, " part({part_id:#x})").unwrap();
                     }
                 }
 
@@ -3361,7 +3536,7 @@ impl MinidumpMacCrashInfo {
 
         for i in 0..self.raw.len() {
             writeln!(f)?;
-            writeln!(f, "  RECORD[{}] ", i)?;
+            writeln!(f, "  RECORD[{i}] ")?;
             write_simple_field!(f, version, i);
             write_simple_field!(f, thread, i);
             write_simple_field!(f, dialog_mode, i, "{:x}");
@@ -3373,6 +3548,45 @@ impl MinidumpMacCrashInfo {
             write_simple_field!(f, abort_cause, i, "{:x}");
         }
 
+        writeln!(f)?;
+        Ok(())
+    }
+}
+
+impl<'a> MinidumpStream<'a> for MinidumpMacBootargs {
+    const STREAM_TYPE: u32 = MINIDUMP_STREAM_TYPE::MozMacosBootargsStream as u32;
+
+    fn read(
+        bytes: &[u8],
+        all: &[u8],
+        endian: scroll::Endian,
+        _system_info: Option<&MinidumpSystemInfo>,
+    ) -> Result<MinidumpMacBootargs, Error> {
+        let raw: md::MINIDUMP_MAC_BOOTARGS = bytes
+            .pread_with(0, endian)
+            .or(Err(Error::StreamReadFailure))?;
+
+        let stream_type = raw.stream_type;
+        if stream_type != Self::STREAM_TYPE {
+            warn!(
+                "MozMacosBootargsStream record doesn't have the right stream type? {}",
+                Self::STREAM_TYPE
+            );
+        }
+        let mut bootargs_offset = raw.bootargs as usize;
+        let bootargs = read_string_utf16(&mut bootargs_offset, all, endian);
+
+        Ok(MinidumpMacBootargs { raw, bootargs })
+    }
+}
+
+impl MinidumpMacBootargs {
+    pub fn print<T: Write>(&self, f: &mut T) -> io::Result<()> {
+        writeln!(
+            f,
+            "mac_boot_args = {}",
+            self.bootargs.as_deref().unwrap_or("")
+        )?;
         writeln!(f)?;
         Ok(())
     }
@@ -3394,7 +3608,6 @@ impl<'a> MinidumpStream<'a> for MinidumpLinuxLsbRelease<'a> {
 impl<'a> MinidumpStream<'a> for MinidumpLinuxEnviron<'a> {
     const STREAM_TYPE: u32 = MINIDUMP_STREAM_TYPE::LinuxEnviron as u32;
 
-    #[allow(clippy::single_match)]
     fn read(
         bytes: &'a [u8],
         _all: &'a [u8],
@@ -3408,7 +3621,6 @@ impl<'a> MinidumpStream<'a> for MinidumpLinuxEnviron<'a> {
 impl<'a> MinidumpStream<'a> for MinidumpLinuxProcStatus<'a> {
     const STREAM_TYPE: u32 = MINIDUMP_STREAM_TYPE::LinuxProcStatus as u32;
 
-    #[allow(clippy::single_match)]
     fn read(
         bytes: &'a [u8],
         _all: &'a [u8],
@@ -3595,7 +3807,7 @@ impl MinidumpMiscInfo {
             .build_string()
             .and_then(|string| utf16_to_string(&string[..]))
         {
-            Some(build_string) => writeln!(f, "{}", build_string)?,
+            Some(build_string) => writeln!(f, "{build_string}")?,
             None => writeln!(f, "(invalid)")?,
         }
         write!(f, "  dbg_bld_str                  = ")?;
@@ -3604,7 +3816,7 @@ impl MinidumpMiscInfo {
             .dbg_bld_str()
             .and_then(|string| utf16_to_string(&string[..]))
         {
-            Some(dbg_bld_str) => writeln!(f, "{}", dbg_bld_str)?,
+            Some(dbg_bld_str) => writeln!(f, "{dbg_bld_str}")?,
             None => writeln!(f, "(invalid)")?,
         }
 
@@ -3614,10 +3826,10 @@ impl MinidumpMiscInfo {
                 writeln!(f)?;
                 for (i, feature) in xstate_data.iter() {
                     if let Some(feature) = md::XstateFeatureIndex::from_index(i) {
-                        let feature_name = format!("{:?}", feature);
-                        write!(f, "    feature {:2} - {:22}: ", i, feature_name)?;
+                        let feature_name = format!("{feature:?}");
+                        write!(f, "    feature {i:2} - {feature_name:22}: ")?;
                     } else {
-                        write!(f, "    feature {:2} - (unknown)           : ", i)?;
+                        write!(f, "    feature {i:2} - (unknown)           : ")?;
                     }
                     writeln!(f, " offset {:4}, size {:4}", feature.offset, feature.size)?;
                 }
@@ -3664,7 +3876,7 @@ impl<'a> MinidumpStream<'a> for MinidumpBreakpadInfo {
 
 fn option_or_invalid<T: fmt::LowerHex>(what: &Option<T>) -> Cow<'_, str> {
     match *what {
-        Some(ref val) => Cow::Owned(format!("{:#x}", val)),
+        Some(ref val) => Cow::Owned(format!("{val:#x}")),
         None => Cow::Borrowed("(invalid)"),
     }
 }
@@ -4035,18 +4247,18 @@ impl fmt::Display for CrashReason {
         fn write_nt_status(f: &mut fmt::Formatter<'_>, raw_nt_status: u64) -> fmt::Result {
             let nt_status = err::NtStatusWindows::from_u64(raw_nt_status);
             if let Some(nt_status) = nt_status {
-                write!(f, "{:?}", nt_status)
+                write!(f, "{nt_status:?}")
             } else {
-                write!(f, "{:#010x}", raw_nt_status)
+                write!(f, "{raw_nt_status:#010x}")
             }
         }
 
         fn write_fast_fail(f: &mut fmt::Formatter<'_>, raw_fast_fail: u64) -> fmt::Result {
             let fast_fail = err::FastFailCode::from_u64(raw_fast_fail);
             if let Some(fast_fail) = fast_fail {
-                write!(f, "{:?}", fast_fail)
+                write!(f, "{fast_fail:?}")
             } else {
-                write!(f, "{:#010x}", raw_fast_fail)
+                write!(f, "{raw_fast_fail:#010x}")
             }
         }
 
@@ -4057,7 +4269,7 @@ impl fmt::Display for CrashReason {
             subcode: u64,
         ) -> fmt::Result {
             let flavor = (code >> 58) & 0x7;
-            write!(f, "EXC_RESOURCE / {:?} / ", ex)?;
+            write!(f, "EXC_RESOURCE / {ex:?} / ")?;
             match ex {
                 err::ExceptionCodeMacResourceType::RESOURCE_TYPE_CPU => {
                     // See https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/osfmk/kern/exc_resource.h#L71-L99
@@ -4069,11 +4281,10 @@ impl fmt::Display for CrashReason {
                         let cpu_consumed = subcode & 0x7;
                         write!(
                             f,
-                            "{:?} interval: {}s CPU limit: {}% CPU consumed: {}%",
-                            cpu_flavor, interval, cpu_limit, cpu_consumed
+                            "{cpu_flavor:?} interval: {interval}s CPU limit: {cpu_limit}% CPU consumed: {cpu_consumed}%"
                         )
                     } else {
-                        write!(f, "{:#018x} / {:#018x}", code, subcode)
+                        write!(f, "{code:#018x} / {subcode:#018x}")
                     }
                 }
                 err::ExceptionCodeMacResourceType::RESOURCE_TYPE_WAKEUPS => {
@@ -4086,11 +4297,10 @@ impl fmt::Display for CrashReason {
                         let wakeups_observed = subcode & 0xfff;
                         write!(
                             f,
-                            "{:?} interval: {}s wakeups permitted: {} wakeups observed: {}",
-                            wakeups_flavor, interval, wakeups_permitted, wakeups_observed
+                            "{wakeups_flavor:?} interval: {interval}s wakeups permitted: {wakeups_permitted} wakeups observed: {wakeups_observed}"
                         )
                     } else {
-                        write!(f, "{:#018x} / {:#018x}", code, subcode)
+                        write!(f, "{code:#018x} / {subcode:#018x}")
                     }
                 }
                 err::ExceptionCodeMacResourceType::RESOURCE_TYPE_MEMORY => {
@@ -4099,13 +4309,9 @@ impl fmt::Display for CrashReason {
                         err::ExceptionCodeMacResourceMemoryFlavor::from_u64(flavor)
                     {
                         let hwm_limit = code & 0x1fff;
-                        write!(
-                            f,
-                            "{:?} high watermark limit: {}MiB",
-                            memory_flavor, hwm_limit
-                        )
+                        write!(f, "{memory_flavor:?} high watermark limit: {hwm_limit}MiB")
                     } else {
-                        write!(f, "{:#018x} / {:#018x}", code, subcode)
+                        write!(f, "{code:#018x} / {subcode:#018x}")
                     }
                 }
                 err::ExceptionCodeMacResourceType::RESOURCE_TYPE_IO => {
@@ -4117,11 +4323,10 @@ impl fmt::Display for CrashReason {
                         let io_observed = subcode & 0x7fff;
                         write!(
                             f,
-                            "{:?} interval: {}s I/O limit: {}% I/O observed: {}%",
-                            io_flavor, interval, io_limit, io_observed
+                            "{io_flavor:?} interval: {interval}s I/O limit: {io_limit}% I/O observed: {io_observed}%"
                         )
                     } else {
-                        write!(f, "{:#018x} / {:#018x}", code, subcode)
+                        write!(f, "{code:#018x} / {subcode:#018x}")
                     }
                 }
                 err::ExceptionCodeMacResourceType::RESOURCE_TYPE_THREADS => {
@@ -4130,13 +4335,9 @@ impl fmt::Display for CrashReason {
                         err::ExceptionCodeMacResourceThreadsFlavor::from_u64(flavor)
                     {
                         let hwm_limit = code & 0x7fff;
-                        write!(
-                            f,
-                            "{:?} high watermark limit: {}",
-                            threads_flavor, hwm_limit
-                        )
+                        write!(f, "{threads_flavor:?} high watermark limit: {hwm_limit}")
                     } else {
-                        write!(f, "{:#018x} / {:#018x}", code, subcode)
+                        write!(f, "{code:#018x} / {subcode:#018x}")
                     }
                 }
             }
@@ -4149,7 +4350,7 @@ impl fmt::Display for CrashReason {
             subcode: u64,
         ) -> fmt::Result {
             let flavor = (code >> 32) & 0x1fffffff;
-            write!(f, "EXC_GUARD / {:?}", ex)?;
+            write!(f, "EXC_GUARD / {ex:?}")?;
             match ex {
                 err::ExceptionCodeMacGuardType::GUARD_TYPE_NONE => {
                     write!(f, "")
@@ -4162,11 +4363,10 @@ impl fmt::Display for CrashReason {
                         let port_name = code & 0xfffffff;
                         write!(
                             f,
-                            " / {:?} port name: {} guard identifier: {}",
-                            mach_port_flavor, port_name, subcode,
+                            " / {mach_port_flavor:?} port name: {port_name} guard identifier: {subcode}",
                         )
                     } else {
-                        write!(f, " / {:#018x} / {:#018x}", code, subcode)
+                        write!(f, " / {code:#018x} / {subcode:#018x}")
                     }
                 }
                 err::ExceptionCodeMacGuardType::GUARD_TYPE_FD => {
@@ -4175,33 +4375,24 @@ impl fmt::Display for CrashReason {
                         let fd = code & 0xfffffff;
                         write!(
                             f,
-                            " / {:?} file descriptor: {} guard identifier: {}",
-                            fd_flavor, fd, subcode,
+                            " / {fd_flavor:?} file descriptor: {fd} guard identifier: {subcode}",
                         )
                     } else {
-                        write!(f, " / {:#018x} / {:#018x}", code, subcode)
+                        write!(f, " / {code:#018x} / {subcode:#018x}")
                     }
                 }
                 err::ExceptionCodeMacGuardType::GUARD_TYPE_USER => {
                     // See https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/osfmk/kern/exc_guard.h#L101-L113
                     let namespace = code & 0xffffffff;
-                    write!(
-                        f,
-                        "/ namespace: {} guard identifier: {}",
-                        namespace, subcode,
-                    )
+                    write!(f, "/ namespace: {namespace} guard identifier: {subcode}",)
                 }
                 err::ExceptionCodeMacGuardType::GUARD_TYPE_VN => {
                     // See https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/osfmk/kern/exc_guard.h#L117-L129
                     if let Some(vn_flavor) = err::ExceptionCodeMacGuardVNFlavor::from_u64(flavor) {
                         let pid = code & 0xfffffff;
-                        write!(
-                            f,
-                            " / {:?} pid: {} guard identifier: {}",
-                            vn_flavor, pid, subcode,
-                        )
+                        write!(f, " / {vn_flavor:?} pid: {pid} guard identifier: {subcode}",)
                     } else {
-                        write!(f, " / {:#018x} / {:#018x}", code, subcode)
+                        write!(f, " / {code:#018x} / {subcode:#018x}")
                     }
                 }
                 err::ExceptionCodeMacGuardType::GUARD_TYPE_VIRT_MEMORY => {
@@ -4209,9 +4400,9 @@ impl fmt::Display for CrashReason {
                     if let Some(virt_memory_flavor) =
                         err::ExceptionCodeMacGuardVirtMemoryFlavor::from_u64(flavor)
                     {
-                        write!(f, " / {:?} offset: {}", virt_memory_flavor, subcode)
+                        write!(f, " / {virt_memory_flavor:?} offset: {subcode}")
                     } else {
-                        write!(f, " / {:#018x} / {:#018x}", code, subcode)
+                        write!(f, " / {code:#018x} / {subcode:#018x}")
                     }
                 }
             }
@@ -4224,12 +4415,12 @@ impl fmt::Display for CrashReason {
         ) -> fmt::Result {
             if let Some(si_code) = err::ExceptionCodeLinuxSicode::from_u32(flags) {
                 if si_code == err::ExceptionCodeLinuxSicode::SI_USER {
-                    write!(f, "{:?}", ex)
+                    write!(f, "{ex:?}")
                 } else {
-                    write!(f, "{:?} / {:?}", ex, si_code)
+                    write!(f, "{ex:?} / {si_code:?}")
                 }
             } else {
-                write!(f, "{:?} / {:#010x}", ex, flags)
+                write!(f, "{ex:?} / {flags:#010x}")
             }
         }
 
@@ -4243,21 +4434,21 @@ impl fmt::Display for CrashReason {
             MacGeneral(err::ExceptionCodeMac::SIMULATED, _) => write!(f, "Simulated Exception"),
 
             // Thse codes just repeat their names
-            MacGeneral(ex, flags) => write!(f, "{:?} / {:#010x}", ex, flags),
-            MacBadAccessKern(ex) => write!(f, "EXC_BAD_ACCESS / {:?}", ex),
-            MacBadAccessArm(ex) => write!(f, "EXC_BAD_ACCESS / {:?}", ex),
-            MacBadAccessPpc(ex) => write!(f, "EXC_BAD_ACCESS / {:?}", ex),
-            MacBadAccessX86(ex) => write!(f, "EXC_BAD_ACCESS / {:?}", ex),
-            MacBadInstructionArm(ex) => write!(f, "EXC_BAD_INSTRUCTION / {:?}", ex),
-            MacBadInstructionPpc(ex) => write!(f, "EXC_BAD_INSTRUCTION / {:?}", ex),
-            MacBadInstructionX86(ex) => write!(f, "EXC_BAD_INSTRUCTION / {:?}", ex),
-            MacArithmeticArm(ex) => write!(f, "EXC_ARITHMETIC / {:?}", ex),
-            MacArithmeticPpc(ex) => write!(f, "EXC_ARITHMETIC / {:?}", ex),
-            MacArithmeticX86(ex) => write!(f, "EXC_ARITHMETIC / {:?}", ex),
-            MacSoftware(ex) => write!(f, "EXC_SOFTWARE / {:?}", ex),
-            MacBreakpointArm(ex) => write!(f, "EXC_BREAKPOINT / {:?}", ex),
-            MacBreakpointPpc(ex) => write!(f, "EXC_BREAKPOINT / {:?}", ex),
-            MacBreakpointX86(ex) => write!(f, "EXC_BREAKPOINT / {:?}", ex),
+            MacGeneral(ex, flags) => write!(f, "{ex:?} / {flags:#010x}"),
+            MacBadAccessKern(ex) => write!(f, "EXC_BAD_ACCESS / {ex:?}"),
+            MacBadAccessArm(ex) => write!(f, "EXC_BAD_ACCESS / {ex:?}"),
+            MacBadAccessPpc(ex) => write!(f, "EXC_BAD_ACCESS / {ex:?}"),
+            MacBadAccessX86(ex) => write!(f, "EXC_BAD_ACCESS / {ex:?}"),
+            MacBadInstructionArm(ex) => write!(f, "EXC_BAD_INSTRUCTION / {ex:?}"),
+            MacBadInstructionPpc(ex) => write!(f, "EXC_BAD_INSTRUCTION / {ex:?}"),
+            MacBadInstructionX86(ex) => write!(f, "EXC_BAD_INSTRUCTION / {ex:?}"),
+            MacArithmeticArm(ex) => write!(f, "EXC_ARITHMETIC / {ex:?}"),
+            MacArithmeticPpc(ex) => write!(f, "EXC_ARITHMETIC / {ex:?}"),
+            MacArithmeticX86(ex) => write!(f, "EXC_ARITHMETIC / {ex:?}"),
+            MacSoftware(ex) => write!(f, "EXC_SOFTWARE / {ex:?}"),
+            MacBreakpointArm(ex) => write!(f, "EXC_BREAKPOINT / {ex:?}"),
+            MacBreakpointPpc(ex) => write!(f, "EXC_BREAKPOINT / {ex:?}"),
+            MacBreakpointX86(ex) => write!(f, "EXC_BREAKPOINT / {ex:?}"),
             MacResource(ex, code, subcode) => write_exc_resource(f, ex, code, subcode),
             MacGuard(ex, code, subcode) => write_exc_guard(f, ex, code, subcode),
 
@@ -4265,12 +4456,12 @@ impl fmt::Display for CrashReason {
 
             // These codes just repeat their names
             LinuxGeneral(ex, flags) => write_signal(f, ex, flags),
-            LinuxSigill(ex) => write!(f, "SIGILL / {:?}", ex),
-            LinuxSigtrap(ex) => write!(f, "SIGTRAP / {:?}", ex),
-            LinuxSigbus(ex) => write!(f, "SIGBUS / {:?}", ex),
-            LinuxSigfpe(ex) => write!(f, "SIGFPE / {:?}", ex),
-            LinuxSigsegv(ex) => write!(f, "SIGSEGV / {:?}", ex),
-            LinuxSigsys(ex) => write!(f, "SIGSYS / {:?}", ex),
+            LinuxSigill(ex) => write!(f, "SIGILL / {ex:?}"),
+            LinuxSigtrap(ex) => write!(f, "SIGTRAP / {ex:?}"),
+            LinuxSigbus(ex) => write!(f, "SIGBUS / {ex:?}"),
+            LinuxSigfpe(ex) => write!(f, "SIGFPE / {ex:?}"),
+            LinuxSigsegv(ex) => write!(f, "SIGSEGV / {ex:?}"),
+            LinuxSigsys(ex) => write!(f, "SIGSYS / {ex:?}"),
 
             // ======================== Windows =============================
 
@@ -4283,24 +4474,24 @@ impl fmt::Display for CrashReason {
                 write!(f, "Simulated Exception")
             }
             // These codes just repeat their names
-            WindowsGeneral(ex) => write!(f, "{:?}", ex),
-            WindowsWinError(winerror) => write!(f, "{:?}", winerror),
+            WindowsGeneral(ex) => write!(f, "{ex:?}"),
+            WindowsWinError(winerror) => write!(f, "{winerror:?}"),
             WindowsWinErrorWithFacility(facility, winerror) => {
-                write!(f, "{:?} / {:?}", facility, winerror)
+                write!(f, "{facility:?} / {winerror:?}")
             }
             WindowsNtStatus(nt_status) => write_nt_status(f, nt_status as _),
-            WindowsAccessViolation(ex) => write!(f, "EXCEPTION_ACCESS_VIOLATION_{:?}", ex),
+            WindowsAccessViolation(ex) => write!(f, "EXCEPTION_ACCESS_VIOLATION_{ex:?}"),
             WindowsInPageError(ex, nt_status) => {
-                write!(f, "EXCEPTION_IN_PAGE_ERROR_{:?} / ", ex)?;
+                write!(f, "EXCEPTION_IN_PAGE_ERROR_{ex:?} / ")?;
                 write_nt_status(f, nt_status)
             }
             WindowsStackBufferOverrun(fast_fail) => {
                 write!(f, "EXCEPTION_STACK_BUFFER_OVERRUN / ")?;
                 write_fast_fail(f, fast_fail)
             }
-            WindowsUnknown(code) => write!(f, "unknown {:#010x}", code),
+            WindowsUnknown(code) => write!(f, "unknown {code:#010x}"),
 
-            Unknown(code, flags) => write!(f, "unknown {:#010x} / {:#010x}", code, flags),
+            Unknown(code, flags) => write!(f, "unknown {code:#010x} / {flags:#010x}"),
         }
     }
 }
@@ -4343,7 +4534,7 @@ impl<'a> MinidumpException<'a> {
         &self,
         system_info: &MinidumpSystemInfo,
         misc: Option<&MinidumpMiscInfo>,
-    ) -> Option<Cow<MinidumpContext>> {
+    ) -> Option<Cow<'a, MinidumpContext>> {
         MinidumpContext::read(self.context?, self.endian, system_info, misc)
             .ok()
             .map(Cow::Owned)
@@ -4488,7 +4679,9 @@ fn utf16_to_string(data: &[u16]) -> Option<String> {
     let len = data.iter().take_while(|c| **c != 0).count();
     let s16 = &data[..len];
     let bytes = unsafe { slice::from_raw_parts(s16.as_ptr() as *const u8, s16.len() * 2) };
-    UTF_16LE.decode(bytes, DecoderTrap::Strict).ok()
+    encoding_rs::UTF_16LE
+        .decode_without_bom_handling_and_without_replacement(bytes)
+        .map(String::from)
 }
 
 impl MinidumpAssertion {
@@ -4752,7 +4945,7 @@ impl MinidumpCrashpadInfo {
         )?;
 
         for (name, value) in &self.simple_annotations {
-            writeln!(f, "  simple_annotations[\"{}\"] = {}", name, value)?;
+            writeln!(f, "  simple_annotations[\"{name}\"] = {value}")?;
         }
 
         for (index, module) in self.module_list.iter().enumerate() {
@@ -4770,29 +4963,26 @@ impl MinidumpCrashpadInfo {
             for (annotation_index, annotation) in module.list_annotations.iter().enumerate() {
                 writeln!(
                     f,
-                    "  module_list[{}].list_annotations[{}] = {}",
-                    index, annotation_index, annotation,
+                    "  module_list[{index}].list_annotations[{annotation_index}] = {annotation}",
                 )?;
             }
 
             for (name, value) in &module.simple_annotations {
                 writeln!(
                     f,
-                    "  module_list[{}].simple_annotations[\"{}\"] = {}",
-                    index, name, value,
+                    "  module_list[{index}].simple_annotations[\"{name}\"] = {value}",
                 )?;
             }
 
             for (name, value) in &module.annotation_objects {
                 write!(
                     f,
-                    "  module_list[{}].annotation_objects[\"{}\"] = ",
-                    index, name,
+                    "  module_list[{index}].annotation_objects[\"{name}\"] = ",
                 )?;
 
                 match value {
                     MinidumpAnnotation::Invalid => writeln!(f, "<invalid>"),
-                    MinidumpAnnotation::String(string) => writeln!(f, "{}", string),
+                    MinidumpAnnotation::String(string) => writeln!(f, "{string}"),
                     MinidumpAnnotation::UserDefined(_) => writeln!(f, "<user defined>"),
                     MinidumpAnnotation::Unsupported(_) => writeln!(f, "<unsupported>"),
                 }?;
@@ -4892,15 +5082,20 @@ where
                 .or(Err(Error::MissingDirectory))?;
             if let Some((old_idx, old_dir)) = streams.insert(dir.stream_type, (i, dir.clone())) {
                 if let Some(known_stream_type) = MINIDUMP_STREAM_TYPE::from_u32(dir.stream_type) {
-                    warn!("Minidump contains multiple streams of type {} ({:?}) at indices {} ({} bytes) and {} ({} bytes) (using {})",
-                        dir.stream_type,
-                        known_stream_type,
-                        old_idx,
-                        old_dir.location.data_size,
-                        i,
-                        dir.location.data_size,
-                        i,
-                    );
+                    if !(known_stream_type == MINIDUMP_STREAM_TYPE::UnusedStream
+                        && old_dir.location.data_size == 0
+                        && dir.location.data_size == 0)
+                    {
+                        warn!("Minidump contains multiple streams of type {} ({:?}) at indices {} ({} bytes) and {} ({} bytes) (using {})",
+                            dir.stream_type,
+                            known_stream_type,
+                            old_idx,
+                            old_dir.location.data_size,
+                            i,
+                            dir.location.data_size,
+                            i,
+                        );
+                    }
                 } else {
                     warn!("Minidump contains multiple streams of unknown type {} at indices {} ({} bytes) and {} ({} bytes) (using {})",
                         dir.stream_type,
@@ -4913,17 +5108,16 @@ where
                 }
             }
         }
-        let system_info =
-            streams
-                .get(&MinidumpSystemInfo::STREAM_TYPE)
-                .and_then(|&(_, ref dir)| {
-                    location_slice(data.deref(), &dir.location)
-                        .ok()
-                        .and_then(|bytes| {
-                            let all_bytes = data.deref();
-                            MinidumpSystemInfo::read(bytes, all_bytes, endian, None).ok()
-                        })
-                });
+        let system_info = streams
+            .get(&MinidumpSystemInfo::STREAM_TYPE)
+            .and_then(|(_, dir)| {
+                location_slice(data.deref(), &dir.location)
+                    .ok()
+                    .and_then(|bytes| {
+                        let all_bytes = data.deref();
+                        MinidumpSystemInfo::read(bytes, all_bytes, endian, None).ok()
+                    })
+            });
 
         Ok(Minidump {
             data,
@@ -4967,7 +5161,7 @@ where
     ///         // Use `Default` to try to make some progress when a stream is missing.
     ///         // This is especially natural for MinidumpMemoryList because
     ///         // everything needs to handle memory lookups failing anyway.
-    ///         let mem = dump.get_stream::<MinidumpMemoryList>().unwrap_or_default();
+    ///         let mem = dump.get_memory().unwrap_or_default();
     ///
     ///         for thread in &threads.threads {
     ///            let stack = thread.stack_memory(&mem);
@@ -5001,6 +5195,7 @@ where
     /// * [`MinidumpLinuxMaps`][]
     /// * [`MinidumpLinuxProcStatus`][]
     /// * [`MinidumpMacCrashInfo`][]
+    /// * [`MinidumpMacBootargs`][]
     /// * [`MinidumpMemoryList`][]
     /// * [`MinidumpMemory64List`][]
     /// * [`MinidumpMemoryInfoList`][]
@@ -5036,11 +5231,23 @@ where
     pub fn get_raw_stream(&'a self, stream_type: u32) -> Result<&'a [u8], Error> {
         match self.streams.get(&stream_type) {
             None => Err(Error::StreamNotFound),
-            Some(&(_, ref dir)) => {
+            Some((_, dir)) => {
                 let bytes = self.data.deref();
                 location_slice(bytes, &dir.location)
             }
         }
+    }
+
+    /// Get whichever of the two MemoryLists are available in the minidump,
+    /// preferring [`MinidumpMemory64List`][].
+    pub fn get_memory(&'a self) -> Option<UnifiedMemoryList<'a>> {
+        self.get_stream::<MinidumpMemory64List>()
+            .map(UnifiedMemoryList::Memory64)
+            .or_else(|_| {
+                self.get_stream::<MinidumpMemoryList>()
+                    .map(UnifiedMemoryList::Memory)
+            })
+            .ok()
     }
 
     /// A listing of all the streams in the Minidump that this library is *aware* of,
@@ -5131,7 +5338,7 @@ where
     pub fn print<W: Write>(&self, f: &mut W) -> io::Result<()> {
         fn get_stream_name(stream_type: u32) -> Cow<'static, str> {
             if let Some(stream) = MINIDUMP_STREAM_TYPE::from_u32(stream_type) {
-                Cow::Owned(format!("{:?}", stream))
+                Cow::Owned(format!("{stream:?}"))
             } else {
                 Cow::Borrowed("unknown")
             }

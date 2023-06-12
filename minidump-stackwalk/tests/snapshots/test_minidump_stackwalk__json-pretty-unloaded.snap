@@ -5,13 +5,16 @@ expression: json_out
 {
   "crash_info": {
     "address": null,
+    "adjusted_address": null,
     "assertion": null,
     "crashing_thread": null,
     "instruction": null,
     "memory_accesses": null,
+    "possible_bit_flips": null,
     "type": null
   },
   "lsb_release": null,
+  "mac_boot_args": null,
   "mac_crash_info": null,
   "main_module": 0,
   "modules": [],

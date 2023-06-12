@@ -1,7 +1,93 @@
 <!-- next-header -->
 # Next Version
 
-TODO
+# Version 0.17.0 (2023-05-17)
+
+* Stack-walking using native debug information was somewhat buggy, after more
+  thorough testing it should be now on-par with breakpad symbol file-based
+  stack-walking.
+
+## New minidump-unwind crate
+
+The stack walking machinery has been extracted from the minidump-processor
+crate and put in a separate one. This crate has significantly less dependencies
+than the minidump-processor crate which makes it easier to vendor it in
+projects that only care about stack walking.
+
+## Guard-page detection
+
+While analyzing a crash minidump-stackwalk will check if the crashing address
+hit a potential guard page. Guard pages are usually introduced by the memory
+allocator around larger allocation and have no permissions set. If the crash
+address hit one of these pages the `memory_accesses` filed in the JSON output
+will contain the `is_likely_guard_page: true` field.
+
+# Version 0.16.0 (2023-04-05)
+
+* Make all `minidump-common::format` structs writable with `scroll`.
+* Don't fail reading the entire module list if one module has an invalid size.
+* All crates now explicitly include the MIT license
+* The stack walker will now fetch the CPU microcode value from the evil JSON
+  payload when it's not present in the minidump
+* CPU microcode value in the JSON output changed types from u32 to hexstring
+* Crashes with jmp/call/ret instruction to non-canonical addresses now show the
+  real address we jumped to instead of 0x0000000000000000 or 0xffffffffffffffff
+* Updated several dependencies further decreasing the total number of crates
+  it depends upon.
+
+## NULL-pointer crash detection
+
+The `minidump-processor` crate will use the disassembly of the current
+instruction to check whether the crash involved a NULL-pointer access. Crashes
+caused by accessing NULL pointers often exhibit near-NULL address making it less
+clear what the underlying problem was. When using `minidump-stackwalk` the JSON
+output will contain an `adjusted_address` field holding the reason for the
+adjustment (`null-pointer`) as well as the offest from NULL.
+
+## Potential bit-flip detection
+
+The `minidump-processor` crate contains new logic that detects crashes that have
+been potentially caused by a bit-flip in the user's machine memory. This
+detection is driven by a heuristic as it is impossible to completely tell apart
+software crashes from ones induced by flaky hardware. The tests we conducted on
+real crash data showed this heuristic to be very effective in telling apart such
+crashes. When using `minidump-stackwalk` this information will be added to the
+JSON output under the `possible_bit_flips` field.
+
+## Stack walking using native debug information
+
+The stack walker now supports using native debug information available on the
+host in addition to Breakpad .sym files. This functionality is enabled by
+passing the `--use-local-debuginfo` flag to `minidump-stackwalk` when processing
+a crash.
+
+# Version 0.15.2 (2022-12-07)
+
+* Updated the num-range crate, further reducing the number of dependencies
+  required when vendoring this crate
+
+# Version 0.15.1 (2022-12-06)
+
+* Updated yaxpeax for improved performance when disassembling instructions
+* Removed the tracing crate from the dependencies of the minidump-common crate
+
+# Version 0.15.0 (2022-11-30)
+
+* More Windows errors are now handled correctly
+* Small improvements when handling macOS exceptions
+* Hexadecimal values are now printed with consistent width and prefixes
+* Several crates were updated
+* Fixed some links in the documentation
+
+## Support for instruction disassembly
+
+The stackwalker is now capable of disassembling the crashing instruction,
+printing it out as well as its memory operands. This functionality is used to
+improve crash analysis: we implemented the ability to extract the real crashing
+address for global protection fault exceptions on x86-64. These were usually
+the result of an access to a non-canonical memory location and were reported as
+either 0x0000000000000000 or 0xffffffffffffffff depending on the platform,
+irrespective of the actual address.
 
 # Version 0.14.0 (2022-08-03)
 

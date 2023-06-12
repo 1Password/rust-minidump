@@ -1,21 +1,21 @@
 // Copyright 2015 Ted Mielczarek. See the COPYRIGHT
 // file at the top-level directory of this distribution.
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, RangeInclusive};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use minidump::system_info::PointerWidth;
 use minidump::{self, *};
+use minidump_unwind::{
+    walk_stack, CallStack, CallStackInfo, FrameTrust, StackFrame, SymbolProvider, SystemInfo,
+};
 
-use crate::evil;
-use crate::process_state::{CallStack, CallStackInfo, LinuxStandardBase, ProcessState};
-use crate::stackwalker;
-use crate::symbols::*;
-use crate::system_info::SystemInfo;
-use crate::{arg_recovery, FrameTrust, StackFrame};
+use crate::op_analysis::MemoryAccess;
+use crate::process_state::{LinuxStandardBase, ProcessState};
+use crate::{arg_recovery, evil, AdjustedAddress};
 
 /// Configuration of the processor's exact behaviour.
 ///
@@ -417,6 +417,22 @@ where
     process_minidump_with_options(dump, symbol_provider, ProcessorOptions::default()).await
 }
 
+/// Get the microcode version from linux cpu info and evil options.
+fn get_microcode_version(linux_cpu_info: &MinidumpLinuxCpuInfo, evil: &evil::Evil) -> Option<u64> {
+    linux_cpu_info
+        .iter()
+        .find_map(|(key, val)| {
+            if key.as_bytes() == b"microcode" {
+                val.to_str().ok()
+            } else {
+                None
+            }
+        })
+        .or(evil.cpu_microcode_version.as_deref())
+        .and_then(|val| val.strip_prefix("0x"))
+        .and_then(|val| u64::from_str_radix(val, 16).ok())
+}
+
 /// Process `dump` with the given options and return a report as a `ProcessState`.
 ///
 /// See [`ProcessorOptions`][] for details on the specific features that can be
@@ -430,350 +446,574 @@ where
     T: Deref<Target = [u8]> + 'a,
     P: SymbolProvider + Sync,
 {
-    options.check_deprecated_and_disabled();
+    let info = MinidumpInfo::new(dump, options)?;
 
-    // Thread list is required for processing.
-    let thread_list = dump
-        .get_stream::<MinidumpThreadList>()
-        .or(Err(ProcessError::MissingThreadList))?;
+    let mut exception_details = info.get_exception_details();
 
-    let num_threads = thread_list.threads.len() as u64;
-    if let Some(reporter) = options.stat_reporter {
-        reporter.set_total_threads(num_threads);
+    if let Some(details) = &mut exception_details {
+        info.check_for_bitflips(details);
+        info.check_for_guard_pages(details);
     }
-
-    // Try to get thread names, but it's only a nice-to-have.
-    let thread_names = dump
-        .get_stream::<MinidumpThreadNames>()
-        .unwrap_or_else(|_| MinidumpThreadNames::default());
-
-    // System info is required for processing.
-    let dump_system_info = dump
-        .get_stream::<MinidumpSystemInfo>()
-        .or(Err(ProcessError::MissingSystemInfo))?;
-
-    let (os_version, os_build) = dump_system_info.os_parts();
-
-    let linux_standard_base = dump.get_stream::<MinidumpLinuxLsbRelease>().ok();
-    let linux_cpu_info = dump
-        .get_stream::<MinidumpLinuxCpuInfo>()
-        .unwrap_or_default();
-    let _linux_environ = dump.get_stream::<MinidumpLinuxEnviron>().ok();
-    let _linux_proc_status = dump.get_stream::<MinidumpLinuxProcStatus>().ok();
-
-    // Extract everything we care about from linux streams here.
-    // We don't eagerly process them in the minidump crate because there's just
-    // tons of random information in there and it's not obvious what anyone
-    // would care about. So just providing an iterator and letting minidump-processor
-    // pull out the things it cares about is simple and effective.
-
-    let mut cpu_microcode_version = None;
-    for (key, val) in linux_cpu_info.iter() {
-        if key.as_bytes() == b"microcode" {
-            cpu_microcode_version = val
-                .to_str()
-                .ok()
-                .and_then(|val| val.strip_prefix("0x"))
-                .and_then(|val| u64::from_str_radix(val, 16).ok());
-            break;
-        }
-    }
-
-    let linux_standard_base = linux_standard_base.map(|linux_standard_base| {
-        let mut lsb = LinuxStandardBase::default();
-        for (key, val) in linux_standard_base.iter() {
-            match key.as_bytes() {
-                b"DISTRIB_ID" | b"ID" => lsb.id = val.to_string_lossy().into_owned(),
-                b"DISTRIB_RELEASE" | b"VERSION_ID" => {
-                    lsb.release = val.to_string_lossy().into_owned()
-                }
-                b"DISTRIB_CODENAME" | b"VERSION_CODENAME" => {
-                    lsb.codename = val.to_string_lossy().into_owned()
-                }
-                b"DISTRIB_DESCRIPTION" | b"PRETTY_NAME" => {
-                    lsb.description = val.to_string_lossy().into_owned()
-                }
-                _ => {}
-            }
-        }
-        lsb
-    });
-
-    let cpu_info = dump_system_info
-        .cpu_info()
-        .map(|string| string.into_owned());
-
-    let system_info = SystemInfo {
-        os: dump_system_info.os,
-        os_version: Some(os_version),
-        os_build,
-        cpu: dump_system_info.cpu,
-        cpu_info,
-        cpu_microcode_version,
-        cpu_count: dump_system_info.raw.number_of_processors as usize,
-    };
-
-    let mac_crash_info = dump
-        .get_stream::<MinidumpMacCrashInfo>()
-        .ok()
-        .map(|info| info.raw);
-
-    let misc_info = dump.get_stream::<MinidumpMiscInfo>().ok();
-    // Process create time is optional.
-    let (process_id, process_create_time) = if let Some(misc_info) = misc_info.as_ref() {
-        (
-            misc_info.raw.process_id().cloned(),
-            misc_info.process_create_time(),
-        )
-    } else {
-        (None, None)
-    };
-    // If Breakpad info exists in dump, get dump and requesting thread ids.
-    let breakpad_info = dump.get_stream::<MinidumpBreakpadInfo>();
-    let (dump_thread_id, requesting_thread_id) = if let Ok(info) = breakpad_info {
-        (info.dump_thread_id, info.requesting_thread_id)
-    } else {
-        (None, None)
-    };
-    // Get assertion
-    let assertion = None;
-    let modules = match dump.get_stream::<MinidumpModuleList>() {
-        Ok(module_list) => module_list,
-        // Just give an empty list, simplifies things.
-        Err(_) => MinidumpModuleList::new(),
-    };
-    let unloaded_modules = match dump.get_stream::<MinidumpUnloadedModuleList>() {
-        Ok(module_list) => module_list,
-        // Just give an empty list, simplifies things.
-        Err(_) => MinidumpUnloadedModuleList::new(),
-    };
-    let memory_list = dump.get_stream::<MinidumpMemoryList>().unwrap_or_default();
-    let memory_info_list = dump.get_stream::<MinidumpMemoryInfoList>().ok();
-    let linux_maps = dump.get_stream::<MinidumpLinuxMaps>().ok();
-    let _memory_info = UnifiedMemoryInfoList::new(memory_info_list, linux_maps).unwrap_or_default();
-
-    // Get exception info if it exists.
-    let exception_stream = dump.get_stream::<MinidumpException>().ok();
-    let exception_ref = exception_stream.as_ref();
-
-    let exception_info = exception_ref.map(|exception| {
-        let reason = exception.get_crash_reason(system_info.os, system_info.cpu);
-        let address = exception.get_crash_address(system_info.os, system_info.cpu);
-
-        let (instruction_str, memory_accesses) = exception
-            .context(&dump_system_info, misc_info.as_ref())
-            .map(|context| {
-                let instruction_str =
-                    crate::op_analysis::pretty_print_thread_instruction(&context, &memory_list)
-                        .map_err(|e| tracing::warn!("failed to pretty print instruction: {}", e))
-                        .ok();
-
-                let memory_accesses =
-                    crate::op_analysis::get_thread_memory_access(&context, &memory_list)
-                        .map_err(|e| {
-                            tracing::warn!("failed to get instruction memory access: {}", e)
-                        })
-                        .ok();
-
-                (instruction_str, memory_accesses)
-            })
-            .unwrap_or((None, None));
-
-        let mut exception_info = crate::ExceptionInfo {
-            reason,
-            address,
-            instruction_str,
-            memory_accesses,
-        };
-
-        // If we detect that the crash was caused by a non-canonical memory access, overwrite the bogus exception address
-        // with the one we've detected from disassembling the current instruction
-        fix_non_canonical_crash_address(&system_info, &mut exception_info);
-
-        exception_info
-    });
-
-    let crashing_thread_id = exception_ref.map(|e| e.get_crashing_thread_id());
-
-    let exception_context =
-        exception_ref.and_then(|e| e.context(&dump_system_info, misc_info.as_ref()));
-
-    // Get the evil JSON file (thread names and module certificates)
-    let evil = options
-        .evil_json
-        .and_then(evil::handle_evil)
-        .unwrap_or_default();
-
-    let mut requesting_thread = None;
-
-    let threads = thread_list
-        .threads
-        .iter()
-        .enumerate()
-        .map(|(i, thread)| {
-            let id = thread.raw.thread_id;
-
-            // If this is the thread that wrote the dump, skip processing it.
-            if dump_thread_id == Some(id) {
-                return CallStack::with_info(id, CallStackInfo::DumpThreadSkipped);
-            }
-
-            let thread_context = thread.context(&dump_system_info, misc_info.as_ref());
-            // If this thread requested the dump then try to use the exception
-            // context if it exists. (prefer the exception stream's thread id over
-            // the breakpad info stream's thread id.)
-            let context = if crashing_thread_id.or(requesting_thread_id) == Some(id) {
-                requesting_thread = Some(i);
-                exception_context.as_deref().or(thread_context.as_deref())
-            } else {
-                thread_context.as_deref()
-            };
-
-            let name = thread_names
-                .get_name(thread.raw.thread_id)
-                .map(|cow| cow.into_owned())
-                .or_else(|| evil.thread_names.get(&thread.raw.thread_id).cloned());
-
-            let (info, frames) = if let Some(context) = context {
-                let ctx = context.clone();
-                (
-                    CallStackInfo::Ok,
-                    vec![StackFrame::from_context(ctx, FrameTrust::Context)],
-                )
-            } else {
-                (CallStackInfo::MissingContext, vec![])
-            };
-
-            CallStack {
-                frames,
-                info,
-                thread_id: id,
-                thread_name: name,
-                last_error_value: thread.last_error(system_info.cpu, &memory_list),
-            }
-        })
-        .collect();
-
-    // Collect up info on unimplemented/unknown modules
-    let unknown_streams = dump.unknown_streams().collect();
-    let unimplemented_streams = dump.unimplemented_streams().collect();
-
-    // Get symbol stats from the symbolizer
-    let symbol_stats = symbol_provider.stats();
-
-    let mut state = ProcessState {
-        process_id,
-        time: SystemTime::UNIX_EPOCH + Duration::from_secs(dump.header.time_date_stamp as u64),
-        process_create_time,
-        cert_info: evil.certs,
-        exception_info,
-        assertion,
-        requesting_thread,
-        system_info,
-        linux_standard_base,
-        mac_crash_info,
-        threads,
-        modules,
-        unloaded_modules,
-        unknown_streams,
-        unimplemented_streams,
-        symbol_stats,
-    };
-
-    // Report the unwalked result
-    if let Some(reporter) = options.stat_reporter {
-        reporter.add_unwalked_result(&state);
-    }
-
-    {
-        let memory_list = &memory_list;
-        let modules = &state.modules;
-        let system_info = &state.system_info;
-        let unloaded_modules = &state.unloaded_modules;
-        let options = &options;
-
-        futures_util::future::join_all(
-            state
-                .threads
-                .iter_mut()
-                .zip(thread_list.threads.iter())
-                .enumerate()
-                .map(|(i, (stack, thread))| async move {
-                    let mut stack_memory = thread.stack_memory(memory_list);
-                    // Always chose the memory region that is referenced by the context,
-                    // as the `exception_context` may refer to a different memory region than
-                    // the `thread_context`, which in turn would fail to stack walk.
-                    let stack_ptr = stack
-                        .frames
-                        .get(0)
-                        .map(|ctx_frame| ctx_frame.context.get_stack_pointer());
-                    if let Some(stack_ptr) = stack_ptr {
-                        let contains_stack_ptr = stack_memory
-                            .as_ref()
-                            .and_then(|memory| memory.get_memory_at_address::<u64>(stack_ptr))
-                            .is_some();
-                        if !contains_stack_ptr {
-                            stack_memory = memory_list
-                                .memory_at_address(stack_ptr)
-                                .map(Cow::Borrowed)
-                                .or(stack_memory);
-                        }
-                    }
-
-                    stackwalker::walk_stack(
-                        i,
-                        options,
-                        stack,
-                        stack_memory.as_deref(),
-                        modules,
-                        system_info,
-                        symbol_provider,
-                    )
-                    .await;
-
-                    for frame in &mut stack.frames {
-                        // If the frame doesn't have a loaded module, try to find an unloaded module
-                        // that overlaps with its address range. The may be multiple, so record all
-                        // of them and the offsets this frame has in them.
-                        if frame.module.is_none() {
-                            let mut offsets = BTreeMap::new();
-                            for unloaded in unloaded_modules.modules_at_address(frame.instruction) {
-                                let offset = frame.instruction - unloaded.raw.base_of_image;
-                                offsets
-                                    .entry(unloaded.name.clone())
-                                    .or_insert_with(BTreeSet::new)
-                                    .insert(offset);
-                            }
-
-                            frame.unloaded_modules = offsets;
-                        }
-                    }
-
-                    if options.recover_function_args {
-                        arg_recovery::fill_arguments(stack, stack_memory.as_deref());
-                    }
-
-                    // Report the unwalked result
-                    if let Some(reporter) = options.stat_reporter {
-                        reporter.inc_processed_threads();
-                    }
-
-                    stack
-                }),
-        )
+    info.into_process_state(dump, symbol_provider, exception_details)
         .await
-    };
-
-    let symbol_stats = symbol_provider.stats();
-    state.symbol_stats = symbol_stats;
-
-    Ok(state)
 }
 
-/// Fix the crash address if a non-canonical access caused a crash
+struct MinidumpInfo<'a> {
+    options: ProcessorOptions<'a>,
+    evil: crate::evil::Evil,
+    thread_list: MinidumpThreadList<'a>,
+    thread_names: MinidumpThreadNames,
+    dump_system_info: MinidumpSystemInfo,
+    linux_standard_base: Option<LinuxStandardBase>,
+    system_info: SystemInfo,
+    mac_crash_info: Option<Vec<RawMacCrashInfo>>,
+    mac_boot_args: Option<MinidumpMacBootargs>,
+    misc_info: Option<MinidumpMiscInfo>,
+    dump_thread_id: Option<u32>,
+    requesting_thread_id: Option<u32>,
+    modules: MinidumpModuleList,
+    unloaded_modules: MinidumpUnloadedModuleList,
+    memory_list: UnifiedMemoryList<'a>,
+    /*
+    memory_info_list: Option<MinidumpMemoryInfoList<'a>>,
+    linux_maps: Option<MinidumpLinuxMaps<'a>>,
+    */
+    memory_info: UnifiedMemoryInfoList<'a>,
+    exception: Option<MinidumpException<'a>>,
+    //exception_details: Option<ExceptionDetails<'a>>,
+}
+
+impl<'a> MinidumpInfo<'a> {
+    pub fn new<T: Deref<Target = [u8]> + 'a>(
+        dump: &'a Minidump<'a, T>,
+        options: ProcessorOptions<'a>,
+    ) -> Result<Self, ProcessError> {
+        options.check_deprecated_and_disabled();
+
+        // Get the evil JSON file (thread names, module certificates, etc)
+        let evil = options
+            .evil_json
+            .and_then(evil::handle_evil)
+            .unwrap_or_default();
+
+        // Thread list is required for processing.
+        let thread_list = dump
+            .get_stream::<MinidumpThreadList>()
+            .or(Err(ProcessError::MissingThreadList))?;
+
+        let num_threads = thread_list.threads.len() as u64;
+        if let Some(reporter) = options.stat_reporter {
+            reporter.set_total_threads(num_threads);
+        }
+
+        // Try to get thread names, but it's only a nice-to-have.
+        let thread_names = dump
+            .get_stream::<MinidumpThreadNames>()
+            .unwrap_or_else(|_| MinidumpThreadNames::default());
+
+        // System info is required for processing.
+        let dump_system_info = dump
+            .get_stream::<MinidumpSystemInfo>()
+            .or(Err(ProcessError::MissingSystemInfo))?;
+
+        let (os_version, os_build) = dump_system_info.os_parts();
+
+        let linux_standard_base = dump.get_stream::<MinidumpLinuxLsbRelease>().ok();
+        let linux_cpu_info = dump
+            .get_stream::<MinidumpLinuxCpuInfo>()
+            .unwrap_or_default();
+        let _linux_environ = dump.get_stream::<MinidumpLinuxEnviron>().ok();
+        let _linux_proc_status = dump.get_stream::<MinidumpLinuxProcStatus>().ok();
+
+        // Extract everything we care about from linux streams here.
+        // We don't eagerly process them in the minidump crate because there's just
+        // tons of random information in there and it's not obvious what anyone
+        // would care about. So just providing an iterator and letting minidump-processor
+        // pull out the things it cares about is simple and effective.
+
+        let cpu_microcode_version = get_microcode_version(&linux_cpu_info, &evil);
+
+        let linux_standard_base = linux_standard_base.map(|linux_standard_base| {
+            let mut lsb = LinuxStandardBase::default();
+            for (key, val) in linux_standard_base.iter() {
+                match key.as_bytes() {
+                    b"DISTRIB_ID" | b"ID" => lsb.id = val.to_string_lossy().into_owned(),
+                    b"DISTRIB_RELEASE" | b"VERSION_ID" => {
+                        lsb.release = val.to_string_lossy().into_owned()
+                    }
+                    b"DISTRIB_CODENAME" | b"VERSION_CODENAME" => {
+                        lsb.codename = val.to_string_lossy().into_owned()
+                    }
+                    b"DISTRIB_DESCRIPTION" | b"PRETTY_NAME" => {
+                        lsb.description = val.to_string_lossy().into_owned()
+                    }
+                    _ => {}
+                }
+            }
+            lsb
+        });
+
+        let cpu_info = dump_system_info
+            .cpu_info()
+            .map(|string| string.into_owned());
+
+        let system_info = SystemInfo {
+            os: dump_system_info.os,
+            os_version: Some(os_version),
+            os_build,
+            cpu: dump_system_info.cpu,
+            cpu_info,
+            cpu_microcode_version,
+            cpu_count: dump_system_info.raw.number_of_processors as usize,
+        };
+
+        let mac_crash_info = dump
+            .get_stream::<MinidumpMacCrashInfo>()
+            .ok()
+            .map(|info| info.raw);
+
+        let mac_boot_args = dump.get_stream::<MinidumpMacBootargs>().ok();
+
+        let misc_info = dump.get_stream::<MinidumpMiscInfo>().ok();
+        // If Breakpad info exists in dump, get dump and requesting thread ids.
+        let breakpad_info = dump.get_stream::<MinidumpBreakpadInfo>();
+        let (dump_thread_id, requesting_thread_id) = if let Ok(info) = breakpad_info {
+            (info.dump_thread_id, info.requesting_thread_id)
+        } else {
+            (None, None)
+        };
+        // Get assertion
+        let modules = match dump.get_stream::<MinidumpModuleList>() {
+            Ok(module_list) => module_list,
+            // Just give an empty list, simplifies things.
+            Err(_) => MinidumpModuleList::new(),
+        };
+        let unloaded_modules = match dump.get_stream::<MinidumpUnloadedModuleList>() {
+            Ok(module_list) => module_list,
+            // Just give an empty list, simplifies things.
+            Err(_) => MinidumpUnloadedModuleList::new(),
+        };
+        let memory_list = dump.get_memory().unwrap_or_default();
+        let memory_info_list = dump.get_stream::<MinidumpMemoryInfoList>().ok();
+        let linux_maps = dump.get_stream::<MinidumpLinuxMaps>().ok();
+        let memory_info =
+            UnifiedMemoryInfoList::new(memory_info_list, linux_maps).unwrap_or_default();
+
+        // Get exception info if it exists.
+        let exception = dump.get_stream::<MinidumpException>().ok();
+
+        Ok(MinidumpInfo {
+            options,
+            evil,
+            thread_list,
+            thread_names,
+            dump_system_info,
+            linux_standard_base,
+            system_info,
+            mac_crash_info,
+            mac_boot_args,
+            misc_info,
+            dump_thread_id,
+            requesting_thread_id,
+            modules,
+            unloaded_modules,
+            memory_list,
+            /*
+            memory_info_list: Option<MinidumpMemoryInfoList<'a>>,
+            linux_maps: Option<MinidumpLinuxMaps<'a>>,
+            */
+            memory_info,
+            exception,
+            //exception_details: None,
+        })
+    }
+
+    /// Get details about the minidump exception, if available.
+    pub fn get_exception_details(&self) -> Option<ExceptionDetails<'a>> {
+        let exception = self.exception.as_ref()?;
+
+        let reason = exception.get_crash_reason(self.system_info.os, self.system_info.cpu);
+        let address = exception.get_crash_address(self.system_info.os, self.system_info.cpu);
+
+        let stack_memory_ref = self
+            .thread_list
+            .get_thread(exception.get_crashing_thread_id())
+            .and_then(|thread| thread.stack_memory(&self.memory_list));
+
+        let context = exception.context(&self.dump_system_info, self.misc_info.as_ref());
+
+        let mut exception_info: Option<crate::ExceptionInfo> = None;
+        let mut instruction_registers: BTreeSet<&'static str> = Default::default();
+
+        // If we have a context, we can attempt to analyze the crashing thread's instructions
+        if let Some(context) = context.as_ref() {
+            match crate::op_analysis::analyze_thread_context(
+                context,
+                &self.memory_list,
+                stack_memory_ref,
+            ) {
+                Ok(op_analysis) => {
+                    let memory_accesses = op_analysis.memory_accesses.as_deref();
+
+                    let adjusted_address = try_detect_null_pointer_in_disguise(memory_accesses)
+                        .map(|offset| AdjustedAddress::NullPointerWithOffset(offset.into()))
+                        .or_else(|| {
+                            try_get_non_canonical_crash_address(
+                                &self.system_info,
+                                memory_accesses,
+                                reason,
+                                address,
+                            )
+                            .map(|addr| AdjustedAddress::NonCanonical(addr.into()))
+                        });
+
+                    exception_info = Some(crate::ExceptionInfo {
+                        reason,
+                        address: address.into(),
+                        adjusted_address,
+                        instruction_str: Some(op_analysis.instruction_str),
+                        memory_accesses: op_analysis.memory_accesses,
+                        possible_bit_flips: Default::default(),
+                    });
+                    instruction_registers = op_analysis.registers;
+                }
+                Err(e) => {
+                    tracing::warn!("failed to analyze the thread context: {e}");
+                }
+            }
+        }
+
+        let info = exception_info.unwrap_or_else(|| crate::ExceptionInfo {
+            reason,
+            address: address.into(),
+            adjusted_address: None,
+            instruction_str: None,
+            memory_accesses: None,
+            possible_bit_flips: Default::default(),
+        });
+
+        Some(ExceptionDetails {
+            info,
+            context,
+            instruction_registers,
+        })
+    }
+
+    /// Check for bit-flips of the exception address/instruction.
+    ///
+    /// Additional bit flip information will be added to `exception_details`.
+    pub fn check_for_bitflips(&self, exception_details: &mut ExceptionDetails<'a>) {
+        // Only check for bit-flips on 64-bit systems, as the large memory space makes
+        // false-positives less likely.
+        if self.system_info.cpu.pointer_width() != PointerWidth::Bits64 {
+            return;
+        }
+
+        let info = &mut exception_details.info;
+
+        use bitflip::BitRange;
+        let bit_flip_address = match &info.adjusted_address {
+            // Use the non canonical address if present.
+            Some(AdjustedAddress::NonCanonical(v)) => Some((v.0, BitRange::Amd64NonCanonical)),
+            // If we think the address is a null pointer with an offset, don't try bit flips.
+            Some(AdjustedAddress::NullPointerWithOffset(_)) => None,
+            // Try the crashing address if no adjustments have been made.
+            None => Some((
+                info.address.0,
+                if self.system_info.cpu != system_info::Cpu::X86_64 {
+                    BitRange::All
+                } else {
+                    BitRange::Amd64Canononical
+                },
+            )),
+        };
+        if let Some((address, bit_range)) = bit_flip_address {
+            let memory_op = bitflip::MemoryOperation::from_crash_reason(&info.reason);
+            info.possible_bit_flips = bitflip::try_bit_flips(
+                address,
+                None,
+                bit_range,
+                exception_details.context.as_deref(),
+                &self.memory_info,
+                memory_op,
+            );
+
+            // If we have an exception context, we can check the registers involved in the
+            // crashing instruction.
+            if let Some(context) = exception_details.context.as_deref() {
+                for reg in &exception_details.instruction_registers {
+                    if let Some(address) = context.get_register(reg) {
+                        info.possible_bit_flips.extend(bitflip::try_bit_flips(
+                            address,
+                            Some(reg),
+                            bit_range,
+                            Some(context),
+                            &self.memory_info,
+                            // We assume that a register that is causing a crash due to a flipped
+                            // bit has the same memory operation as the crash (i.e. we assume that
+                            // the base address, possibly combined with some offset, is still in
+                            // the same memory region).
+                            memory_op,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Check whether memory accesses are accessing likely guard pages.
+    pub fn check_for_guard_pages(&self, exception_details: &mut ExceptionDetails<'a>) {
+        const GUARD_MEMORY_MAX_SIZE: u64 = 2 << 14;
+
+        if let Some(accesses) = &mut exception_details.info.memory_accesses {
+            for access in accesses {
+                let Some(info) = self.memory_info.memory_info_at_address(access.address) else { continue; };
+                let Some(range) = info.memory_range() else { continue; };
+
+                fn is_accessible(range: &UnifiedMemoryInfo) -> bool {
+                    range.is_readable() || range.is_writable() || range.is_executable()
+                }
+
+                let is_adjacent_to_accessible_memory = || {
+                    for region in self.memory_info.by_addr() {
+                        let Some(other_range) = region.memory_range() else { continue; };
+                        if other_range.end + 1 == range.start && is_accessible(&region) {
+                            return true;
+                        }
+                        if range.end + 1 == other_range.start {
+                            // At this point we won't encounter any other relevant regions as we're
+                            // iterating by address, so return.
+                            return is_accessible(&region);
+                        }
+                    }
+                    false
+                };
+
+                // As a heuristic, we consider any mapped memory to be a guard page if it:
+                // * has no permissions,
+                // * is less than `GUARD_MEMORY_MAX_SIZE`, and
+                // * is adjacent to a region with permissions.
+                if !is_accessible(&info)
+                    && range.end - range.start < GUARD_MEMORY_MAX_SIZE
+                    && is_adjacent_to_accessible_memory()
+                {
+                    access.is_likely_guard_page = true;
+                }
+            }
+        }
+    }
+
+    pub async fn into_process_state<P, T>(
+        self,
+        dump: &Minidump<'a, T>,
+        symbol_provider: &P,
+        exception_details: Option<ExceptionDetails<'a>>,
+    ) -> Result<ProcessState, ProcessError>
+    where
+        T: Deref<Target = [u8]> + 'a,
+        P: SymbolProvider + Sync,
+    {
+        let crashing_thread_id = self.exception.as_ref().map(|e| e.get_crashing_thread_id());
+
+        let (exception_info, exception_context) = match exception_details {
+            Some(details) => (Some(details.info), details.context),
+            None => (None, None),
+        };
+
+        let mut requesting_thread = None;
+
+        let threads = self
+            .thread_list
+            .threads
+            .iter()
+            .enumerate()
+            .map(|(i, thread)| {
+                let id = thread.raw.thread_id;
+
+                // If this is the thread that wrote the dump, skip processing it.
+                if self.dump_thread_id == Some(id) {
+                    return CallStack::with_info(id, CallStackInfo::DumpThreadSkipped);
+                }
+
+                let thread_context =
+                    thread.context(&self.dump_system_info, self.misc_info.as_ref());
+                // If this thread requested the dump then try to use the exception
+                // context if it exists. (prefer the exception stream's thread id over
+                // the breakpad info stream's thread id.)
+                let context = if crashing_thread_id.or(self.requesting_thread_id) == Some(id) {
+                    requesting_thread = Some(i);
+                    exception_context.as_deref().or(thread_context.as_deref())
+                } else {
+                    thread_context.as_deref()
+                };
+
+                let name = self
+                    .thread_names
+                    .get_name(thread.raw.thread_id)
+                    .map(|cow| cow.into_owned())
+                    .or_else(|| self.evil.thread_names.get(&thread.raw.thread_id).cloned());
+
+                let (info, frames) = if let Some(context) = context {
+                    let ctx = context.clone();
+                    (
+                        CallStackInfo::Ok,
+                        vec![StackFrame::from_context(ctx, FrameTrust::Context)],
+                    )
+                } else {
+                    (CallStackInfo::MissingContext, vec![])
+                };
+
+                CallStack {
+                    frames,
+                    info,
+                    thread_id: id,
+                    thread_name: name,
+                    last_error_value: thread.last_error(self.system_info.cpu, &self.memory_list),
+                }
+            })
+            .collect();
+
+        // Collect up info on unimplemented/unknown modules
+        let unknown_streams = dump.unknown_streams().collect();
+        let unimplemented_streams = dump.unimplemented_streams().collect();
+
+        // Get symbol stats from the symbolizer
+        let symbol_stats = symbol_provider.stats();
+
+        // Process create time is optional.
+        let (process_id, process_create_time) = if let Some(misc_info) = self.misc_info.as_ref() {
+            (
+                misc_info.raw.process_id().cloned(),
+                misc_info.process_create_time(),
+            )
+        } else {
+            (None, None)
+        };
+
+        let mut state = ProcessState {
+            process_id,
+            time: SystemTime::UNIX_EPOCH + Duration::from_secs(dump.header.time_date_stamp as u64),
+            process_create_time,
+            cert_info: self.evil.certs,
+            exception_info,
+            assertion: None,
+            requesting_thread,
+            system_info: self.system_info,
+            linux_standard_base: self.linux_standard_base,
+            mac_crash_info: self.mac_crash_info,
+            mac_boot_args: self.mac_boot_args,
+            threads,
+            modules: self.modules,
+            unloaded_modules: self.unloaded_modules,
+            unknown_streams,
+            unimplemented_streams,
+            symbol_stats,
+        };
+
+        // Report the unwalked result
+        if let Some(reporter) = self.options.stat_reporter {
+            reporter.add_unwalked_result(&state);
+        }
+
+        {
+            let memory_list = &self.memory_list;
+            let modules = &state.modules;
+            let system_info = &state.system_info;
+            let unloaded_modules = &state.unloaded_modules;
+            let options = &self.options;
+
+            futures_util::future::join_all(
+                state
+                    .threads
+                    .iter_mut()
+                    .zip(self.thread_list.threads.iter())
+                    .enumerate()
+                    .map(|(i, (stack, thread))| async move {
+                        let mut stack_memory = thread.stack_memory(memory_list);
+                        // Always choose the memory region that is referenced by the context,
+                        // as the `exception_context` may refer to a different memory region than
+                        // the `thread_context`, which in turn would fail to stack walk.
+                        let stack_ptr = stack
+                            .frames
+                            .get(0)
+                            .map(|ctx_frame| ctx_frame.context.get_stack_pointer());
+                        if let Some(stack_ptr) = stack_ptr {
+                            let contains_stack_ptr = stack_memory
+                                .as_ref()
+                                .and_then(|memory| memory.get_memory_at_address::<u64>(stack_ptr))
+                                .is_some();
+                            if !contains_stack_ptr {
+                                stack_memory =
+                                    memory_list.memory_at_address(stack_ptr).or(stack_memory);
+                            }
+                        }
+
+                        walk_stack(
+                            |frame_idx: usize, frame: &StackFrame| {
+                                if let Some(reporter) = options.stat_reporter {
+                                    reporter.add_walked_frame(i, frame_idx, frame);
+                                }
+                            },
+                            stack,
+                            stack_memory,
+                            modules,
+                            system_info,
+                            symbol_provider,
+                        )
+                        .await;
+
+                        for frame in &mut stack.frames {
+                            // If the frame doesn't have a loaded module, try to find an unloaded module
+                            // that overlaps with its address range. The may be multiple, so record all
+                            // of them and the offsets this frame has in them.
+                            if frame.module.is_none() {
+                                let mut offsets = BTreeMap::new();
+                                for unloaded in
+                                    unloaded_modules.modules_at_address(frame.instruction)
+                                {
+                                    let offset = frame.instruction - unloaded.raw.base_of_image;
+                                    offsets
+                                        .entry(unloaded.name.clone())
+                                        .or_insert_with(BTreeSet::new)
+                                        .insert(offset);
+                                }
+
+                                frame.unloaded_modules = offsets;
+                            }
+                        }
+
+                        if options.recover_function_args {
+                            arg_recovery::fill_arguments(stack, stack_memory);
+                        }
+
+                        // Report the unwalked result
+                        if let Some(reporter) = options.stat_reporter {
+                            reporter.inc_processed_threads();
+                        }
+
+                        stack
+                    }),
+            )
+            .await
+        };
+
+        let symbol_stats = symbol_provider.stats();
+        state.symbol_stats = symbol_stats;
+
+        Ok(state)
+    }
+}
+
+struct ExceptionDetails<'a> {
+    info: crate::ExceptionInfo,
+    context: Option<std::borrow::Cow<'a, MinidumpContext>>,
+    instruction_registers: BTreeSet<&'static str>,
+}
+
+/// If a non-canonical access caused a crash, return the real address
 ///
 /// Amd64 has the concept of a "canonical addressing", which requires that the upper 16 bits of
-/// an address contain the same binary digit as bit 48. A violation of this rule triggers a
+/// an address contain the same binary digit as bit 47. A violation of this rule triggers a
 /// General Protection Fault instead of the usual Page Fault, which unfortunately means that the
 /// OS has no idea what memory address actually caused the issue
 ///
@@ -781,11 +1021,16 @@ where
 /// memory access info from analyzing the CPU instruction with `op_analysis`, this module will
 /// attempt to determine what address the CPU was instructed to access when the GPF occurred
 ///
-/// Nothing will be changed if the crash was not caused by a non-canonical access
-fn fix_non_canonical_crash_address(
+/// # Return
+///
+/// `Some(address)` if the crash was caused by a non-canonical access and the real address was
+/// determined, `None` otherwise
+fn try_get_non_canonical_crash_address(
     system_info: &SystemInfo,
-    exception_info: &mut crate::ExceptionInfo,
-) {
+    memory_accesses: Option<&[MemoryAccess]>,
+    reason: CrashReason,
+    address: u64,
+) -> Option<u64> {
     use system_info::Cpu;
 
     // The range of non-canonical addresses in the current 48-bit implementation
@@ -794,34 +1039,31 @@ fn fix_non_canonical_crash_address(
 
     // Only Amd64 has non-canonical addresses
     if system_info.cpu != Cpu::X86_64 {
-        return;
+        return None;
     }
 
-    if !is_non_canonical_exception(system_info.os, exception_info) {
-        return;
+    if !is_non_canonical_exception(system_info.os, reason, address) {
+        return None;
     }
 
     // If we weren't able to determine the memory accessed by the instruction, we can't do this analysis
-    let access_iter = match exception_info.memory_accesses {
-        Some(ref v) => v.iter(),
-        None => {
-            tracing::warn!(
-                "lack of instruction analysis prevented determination of non-canonical address"
-            );
-            return;
-        }
-    };
+    if memory_accesses.is_none() {
+        tracing::warn!(
+            "lack of instruction analysis prevented determination of non-canonical address"
+        );
+        return None;
+    }
 
     // If any of the instructions operands were within the non-canonical range, we have our culprit
-    for access in access_iter {
+    for access in memory_accesses.unwrap().iter() {
         if NON_CANONICAL_RANGE.contains(&access.address) {
-            exception_info.address = access.address;
-            tracing::info!("replaced crash address with detected non-canonical address");
-            return;
+            return Some(access.address);
         }
     }
 
     tracing::warn!("somehow got a non-canonical address exception in an instruction that doesn't appear to access one");
+
+    None
 }
 
 /// Report whether the given exception represents a non-canonical access on the given OS
@@ -829,14 +1071,14 @@ fn fix_non_canonical_crash_address(
 /// Different operating systems have different ways of reporting non-canonical address accesses
 /// This function will return whether the given `exception_info` object represents such an access
 /// on the given OS
-fn is_non_canonical_exception(os: system_info::Os, exception_info: &crate::ExceptionInfo) -> bool {
+fn is_non_canonical_exception(os: system_info::Os, reason: CrashReason, address: u64) -> bool {
     use minidump_common::errors as minidump_errors;
     use system_info::Os;
 
     // This is needed because match arms don't allow casting
     const SI_KERNEL_U32: u32 = minidump_errors::ExceptionCodeLinuxSicode::SI_KERNEL as u32;
 
-    match (os, exception_info.reason, exception_info.address) {
+    match (os, reason, address) {
         // Windows reports it as EXCEPTION_ACCESS_VIOLATION_READ, address 0xffffffffffffffff
         (
             Os::Windows,
@@ -871,5 +1113,127 @@ fn is_non_canonical_exception(os: system_info::Os, exception_info: &crate::Excep
             tracing::warn!("we don't currently support non-canonical analysis for your OS");
             false
         }
+    }
+}
+
+/// Try to detect a "null pointer in disguise"
+///
+/// This function will search though all the memory accessses for the instruction and see if any
+/// of them were flagged by `op_analysis` as being a disguised nullptr. If so, we return that
+/// address as an "offset" from the null pointer value
+fn try_detect_null_pointer_in_disguise(memory_accesses: Option<&[MemoryAccess]>) -> Option<u64> {
+    if let Some(memory_accesses) = memory_accesses {
+        for access in memory_accesses.iter() {
+            if access.is_likely_null_pointer_dereference {
+                return Some(access.address);
+            }
+        }
+    }
+    None
+}
+
+/// Bit-flip detection.
+mod bitflip {
+    use super::*;
+    use crate::PossibleBitFlip;
+
+    /// The memory operation occurring when a crash occurred.
+    #[derive(Default, PartialEq, Eq, Clone, Copy)]
+    pub enum MemoryOperation {
+        #[default]
+        Unknown,
+        Read,
+        Write,
+        Execute,
+    }
+
+    impl MemoryOperation {
+        pub fn from_crash_reason(reason: &CrashReason) -> Self {
+            // TODO: it may be possible to derive the read/write/exec when disassembling the faulting
+            // instruction, though this may be fairly verbose to implement.
+            use minidump_common::errors::ExceptionCodeWindowsAccessType as WinAccess;
+            match reason {
+                CrashReason::WindowsAccessViolation(WinAccess::READ) => MemoryOperation::Read,
+                CrashReason::WindowsAccessViolation(WinAccess::WRITE) => MemoryOperation::Write,
+                CrashReason::WindowsAccessViolation(WinAccess::EXEC) => MemoryOperation::Execute,
+                _ => Self::default(),
+            }
+        }
+
+        /// Return whether this memory operation is allowed in the given memory region.
+        pub fn allowed_for(&self, memory_info: &UnifiedMemoryInfo) -> bool {
+            match self {
+                Self::Unknown => true,
+                Self::Read => memory_info.is_readable(),
+                Self::Write => memory_info.is_writable(),
+                Self::Execute => memory_info.is_executable(),
+            }
+        }
+    }
+
+    /// The bit range over which to check bit flips.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum BitRange {
+        Amd64Canononical,
+        Amd64NonCanonical,
+        All,
+    }
+
+    impl BitRange {
+        pub fn range(&self) -> std::ops::Range<u32> {
+            match self {
+                Self::All => 0..u64::BITS,
+                Self::Amd64Canononical => 0..48,
+                Self::Amd64NonCanonical => 48..u64::BITS,
+            }
+        }
+    }
+
+    /// Try to determine whether an address was the result of a flipped bit.
+    ///
+    /// `memory_operation` represents the memory operation that was occurring at the crashing address
+    /// (read/write/exec). If left as `Unknown`, all memory operations are considered allowed.
+    /// Otherwise, specify one of the operations that was occurring.
+    pub fn try_bit_flips(
+        address: u64,
+        source_register: Option<&'static str>,
+        bit_range: BitRange,
+        exception_context: Option<&MinidumpContext>,
+        memory_info: &UnifiedMemoryInfoList,
+        memory_operation: MemoryOperation,
+    ) -> Vec<PossibleBitFlip> {
+        let mut addresses = Vec::new();
+        // If the address maps to valid memory, don't do anything else.
+        if let Some(mi) = memory_info.memory_info_at_address(address) {
+            if memory_operation.allowed_for(&mi) {
+                return addresses;
+            }
+        }
+
+        let create_possible_address = |new_address: u64| {
+            let mut ret = PossibleBitFlip::new(new_address, source_register);
+            ret.calculate_heuristics(
+                address,
+                bit_range == BitRange::Amd64NonCanonical,
+                exception_context,
+            );
+            ret
+        };
+
+        for i in bit_range.range() {
+            let possible_address = address ^ (1 << i);
+            // If the possible address is NULL, we assume that this was the originally intended address
+            // and some logic error has occurred (e.g. a NULL check went the wrong way).
+            if possible_address == 0 {
+                addresses.push(create_possible_address(possible_address));
+            }
+            if let Some(mi) = memory_info.memory_info_at_address(possible_address) {
+                if memory_operation.allowed_for(&mi) {
+                    addresses.push(create_possible_address(possible_address));
+                }
+            }
+        }
+
+        addresses
     }
 }

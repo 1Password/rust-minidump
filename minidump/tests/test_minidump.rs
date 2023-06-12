@@ -21,18 +21,18 @@ fn get_test_minidump_path(filename: &str) -> PathBuf {
     path.push("../");
     path.push("testdata");
     path.push(filename);
-    println!("{:?}", path);
+    println!("{path:?}");
     path
 }
 
 fn read_test_minidump<'a>() -> Result<Minidump<'a, Mmap>, Error> {
     let path = get_test_minidump_path("test.dmp");
-    Minidump::read_path(&path)
+    Minidump::read_path(path)
 }
 
 fn read_linux_minidump<'a>() -> Result<Minidump<'a, Mmap>, Error> {
     let path = get_test_minidump_path("linux-mini.dmp");
-    Minidump::read_path(&path)
+    Minidump::read_path(path)
 }
 
 #[test]
@@ -253,9 +253,7 @@ fn test_thread_list() {
     let thread_list = dump.get_stream::<MinidumpThreadList<'_>>().unwrap();
     let system_info = dump.get_stream::<MinidumpSystemInfo>().unwrap();
     let misc_info = dump.get_stream::<MinidumpMiscInfo>().ok();
-    let memory_list = dump
-        .get_stream::<MinidumpMemoryList<'_>>()
-        .unwrap_or_default();
+    let memory_list = dump.get_memory().unwrap_or_default();
 
     let threads = &thread_list.threads;
     assert_eq!(threads.len(), 2);

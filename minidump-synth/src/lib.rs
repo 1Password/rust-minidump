@@ -16,8 +16,6 @@
 // Some test_assembler types do not have Debug, so be a bit more lenient here.
 #![allow(missing_debug_implementations)]
 
-use encoding::all::UTF_16LE;
-use encoding::{EncoderTrap, Encoding};
 use minidump_common::format as md;
 use scroll::ctx::SizeWith;
 use scroll::LE;
@@ -112,7 +110,7 @@ pub trait CiteLocation {
 impl<T: DumpSection> CiteLocation for T {
     fn cite_location_in(&self, section: Section) -> Section {
         // An MINIDUMP_LOCATION_DESCRIPTOR is just a 32-bit size + 32-bit offset.
-        section.D32(&self.file_size()).D32(&self.file_offset())
+        section.D32(self.file_size()).D32(self.file_offset())
     }
 }
 
@@ -697,7 +695,7 @@ impl Memory64ListStream {
 impl From<Memory64ListStream> for Section {
     fn from(list: Memory64ListStream) -> Self {
         // Finalize the entry count.
-        list.count_label.set_const(list.count as u64);
+        list.count_label.set_const(list.count);
         list.section
     }
 }
@@ -861,7 +859,22 @@ pub struct DumpString {
 impl DumpString {
     /// Create a new `DumpString` with `s` as its contents, using `endian` endianness.
     pub fn new(s: &str, endian: Endian) -> DumpString {
-        let u16_s = UTF_16LE.encode(s, EncoderTrap::Strict).unwrap();
+        let u16_s = s
+            .encode_utf16()
+            .fold(Vec::with_capacity(s.len() * 2), |mut v, s| {
+                match endian {
+                    Endian::Little => {
+                        v.push((s & 0xff) as u8);
+                        v.push((s >> 8) as u8);
+                    }
+                    Endian::Big => {
+                        v.push((s >> 8) as u8);
+                        v.push((s & 0xff) as u8);
+                    }
+                }
+                v
+            });
+
         let section = Section::with_endian(endian)
             .D32(u16_s.len() as u32)
             .append_bytes(&u16_s);
@@ -902,8 +915,8 @@ impl_dumpsection!(DumpUtf8String);
 
 /// A fixed set of version info to use for tests.
 pub const STOCK_VERSION_INFO: md::VS_FIXEDFILEINFO = md::VS_FIXEDFILEINFO {
-    signature: md::VS_FFI_SIGNATURE as u32,
-    struct_version: md::VS_FFI_STRUCVERSION as u32,
+    signature: md::VS_FFI_SIGNATURE,
+    struct_version: md::VS_FFI_STRUCVERSION,
     file_version_hi: 0x11111111,
     file_version_lo: 0x22222222,
     product_version_hi: 0x33333333,

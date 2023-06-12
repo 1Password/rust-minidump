@@ -132,6 +132,9 @@ Options:
           
           This is an experimental feature, which currently only shows up in --human output.
 
+      --use-local-debuginfo
+          Use debug information from local files referred to by the minidump, if present
+
       --symbols-url <SYMBOLS_URL>
           base URL from which URLs to symbol files can be constructed
           
@@ -188,8 +191,8 @@ Options:
           minidump-stackwalk's symbol database.
 
   -h, --help
-          Print help information (use `-h` for a summary)
+          Print help (see a summary with '-h')
 
   -V, --version
-          Print version information
+          Print version
 

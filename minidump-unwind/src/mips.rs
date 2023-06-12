@@ -1,17 +1,13 @@
-use std::collections::HashSet;
-use std::convert::TryFrom;
-
+use super::impl_prelude::*;
 use minidump::format::ContextFlagsCpu;
 use minidump::{
-    CpuContext, Endian, MinidumpContext, MinidumpContextValidity, MinidumpMemory,
-    MinidumpModuleList, MinidumpRawContext,
+    CpuContext, Endian, MinidumpContext, MinidumpContextValidity, MinidumpModuleList,
+    MinidumpRawContext, UnifiedMemory,
 };
 use scroll::ctx::{SizeWith, TryFromCtx};
+use std::collections::HashSet;
+use std::convert::TryFrom;
 use tracing::trace;
-
-use crate::stackwalker::unwind::Unwind;
-use crate::stackwalker::CfiStackWalker;
-use crate::{FrameTrust, StackFrame, SymbolProvider, SystemInfo};
 
 type MipsContext = minidump::format::CONTEXT_MIPS;
 type Pointer = <MipsContext as CpuContext>::Register;
@@ -26,7 +22,7 @@ async fn get_caller_by_cfi<'a, C, P>(
     ctx: &'a C,
     callee: &'a StackFrame,
     grand_callee: Option<&'a StackFrame>,
-    stack_memory: &'a MinidumpMemory<'_>,
+    stack_memory: UnifiedMemory<'a, '_>,
     modules: &'a MinidumpModuleList,
     symbol_provider: &'a P,
 ) -> Option<StackFrame>
@@ -98,7 +94,7 @@ fn callee_forwarded_regs(valid: &MinidumpContextValidity) -> HashSet<&'static st
 async fn get_caller_by_scan32<P>(
     ctx: &Mips32Context,
     callee: &StackFrame,
-    stack_memory: &MinidumpMemory<'_>,
+    stack_memory: UnifiedMemory<'_, '_>,
     modules: &MinidumpModuleList,
     symbol_provider: &P,
 ) -> Option<StackFrame>
@@ -168,7 +164,7 @@ where
 async fn get_caller_by_scan64<P>(
     ctx: &MipsContext,
     callee: &StackFrame,
-    stack_memory: &MinidumpMemory<'_>,
+    stack_memory: UnifiedMemory<'_, '_>,
     modules: &MinidumpModuleList,
     symbol_provider: &P,
 ) -> Option<StackFrame>
@@ -235,7 +231,7 @@ where
         return false;
     }
 
-    super::instruction_seems_valid_by_symbols(instruction as u64, modules, symbol_provider).await
+    super::instruction_seems_valid_by_symbols(instruction, modules, symbol_provider).await
 }
 
 #[async_trait::async_trait]
@@ -244,7 +240,7 @@ impl Unwind for MipsContext {
         &self,
         callee: &StackFrame,
         grand_callee: Option<&StackFrame>,
-        stack_memory: Option<&MinidumpMemory<'_>>,
+        stack_memory: Option<UnifiedMemory<'_, '_>>,
         modules: &MinidumpModuleList,
         _system_info: &SystemInfo,
         syms: &P,
@@ -253,7 +249,7 @@ impl Unwind for MipsContext {
         P: SymbolProvider + Sync,
     {
         let ctx = Mips32Context::try_from(self.clone());
-        let stack = stack_memory.as_ref()?;
+        let stack = stack_memory?;
 
         // .await doesn't like closures, so don't use Option chaining
         let mut frame = None;
@@ -297,7 +293,7 @@ impl Unwind for MipsContext {
         // enforce progress and avoid infinite loops.
 
         let sp = frame.context.get_stack_pointer();
-        let last_sp = self.get_register_always(STACK_POINTER) as u64;
+        let last_sp = self.get_register_always(STACK_POINTER);
         if sp <= last_sp {
             // Mips leaf functions may not actually touch the stack (thanks
             // to the return address register allowing you to "push" the return address
@@ -314,7 +310,7 @@ impl Unwind for MipsContext {
         // Ok, the frame now seems well and truly valid, do final cleanup.
 
         // The Mips `jal` instruction always sets $ra to PC + 8
-        let ip = frame.context.get_instruction_pointer() as u64;
+        let ip = frame.context.get_instruction_pointer();
         frame.instruction = ip - 8;
 
         Some(frame)

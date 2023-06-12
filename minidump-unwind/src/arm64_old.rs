@@ -4,18 +4,16 @@
 // NOTE: arm64_old.rs and arm64.rs should be identical except for the names of
 // their context types.
 
-use crate::process_state::{FrameTrust, StackFrame};
-use crate::stackwalker::unwind::Unwind;
-use crate::stackwalker::CfiStackWalker;
+use super::impl_prelude::*;
 use crate::{SymbolProvider, SystemInfo};
 use minidump::{
-    CpuContext, MinidumpContext, MinidumpContextValidity, MinidumpMemory, MinidumpModuleList,
-    MinidumpRawContext, Module,
+    CpuContext, MinidumpContext, MinidumpContextValidity, MinidumpModuleList, MinidumpRawContext,
+    Module, UnifiedMemory,
 };
 use std::collections::HashSet;
 use tracing::trace;
 
-type ArmContext = minidump::format::CONTEXT_ARM64;
+type ArmContext = minidump::format::CONTEXT_ARM64_OLD;
 type Pointer = <ArmContext as CpuContext>::Register;
 type Registers = minidump::format::Arm64RegisterNumbers;
 
@@ -32,7 +30,7 @@ async fn get_caller_by_cfi<P>(
     ctx: &ArmContext,
     callee: &StackFrame,
     grand_callee: Option<&StackFrame>,
-    stack_memory: &MinidumpMemory<'_>,
+    stack_memory: UnifiedMemory<'_, '_>,
     modules: &MinidumpModuleList,
     symbol_provider: &P,
 ) -> Option<StackFrame>
@@ -58,7 +56,7 @@ where
         // Default to forwarding all callee-saved regs verbatim.
         // The CFI evaluator may clear or overwrite these values.
         // The stack pointer and instruction pointer are not included.
-        caller_ctx: ctx.clone(),
+        caller_ctx: *ctx,
         caller_validity: callee_forwarded_regs(valid),
 
         stack_memory,
@@ -111,7 +109,7 @@ where
     // Let's not do that to keep our code more uniform.
 
     let context = MinidumpContext {
-        raw: MinidumpRawContext::Arm64(stack_walker.caller_ctx),
+        raw: MinidumpRawContext::OldArm64(stack_walker.caller_ctx),
         valid: new_valid,
     };
     Some(StackFrame::from_context(context, FrameTrust::CallFrameInfo))
@@ -132,7 +130,7 @@ fn get_caller_by_frame_pointer<P>(
     ctx: &ArmContext,
     callee: &StackFrame,
     _grand_callee: Option<&StackFrame>,
-    stack_memory: &MinidumpMemory<'_>,
+    stack_memory: UnifiedMemory<'_, '_>,
     modules: &MinidumpModuleList,
     _symbol_provider: &P,
 ) -> Option<StackFrame>
@@ -205,7 +203,7 @@ where
     let last_fp = ctx.get_register(FRAME_POINTER, valid)?;
     let last_sp = ctx.get_register(STACK_POINTER, valid)?;
 
-    if last_fp as u64 >= u64::MAX - POINTER_WIDTH as u64 * 2 {
+    if last_fp >= u64::MAX - POINTER_WIDTH * 2 {
         // Although this code generally works fine if the pointer math overflows,
         // debug builds will still panic, and this guard protects against it without
         // drowning the rest of the code in checked_add.
@@ -218,8 +216,8 @@ where
         (0, 0, last_sp)
     } else {
         (
-            stack_memory.get_memory_at_address(last_fp as u64)?,
-            stack_memory.get_memory_at_address(last_fp + POINTER_WIDTH as u64)?,
+            stack_memory.get_memory_at_address(last_fp)?,
+            stack_memory.get_memory_at_address(last_fp + POINTER_WIDTH)?,
             last_fp + POINTER_WIDTH * 2,
         )
     };
@@ -251,7 +249,7 @@ where
     valid.insert(STACK_POINTER);
 
     let context = MinidumpContext {
-        raw: MinidumpRawContext::Arm64(caller_ctx),
+        raw: MinidumpRawContext::OldArm64(caller_ctx),
         valid: MinidumpContextValidity::Some(valid),
     };
     Some(StackFrame::from_context(context, FrameTrust::FramePointer))
@@ -318,7 +316,7 @@ fn ptr_auth_strip(modules: &MinidumpModuleList, ptr: Pointer) -> Pointer {
 async fn get_caller_by_scan<P>(
     ctx: &ArmContext,
     callee: &StackFrame,
-    stack_memory: &MinidumpMemory<'_>,
+    stack_memory: UnifiedMemory<'_, '_>,
     modules: &MinidumpModuleList,
     symbol_provider: &P,
 ) -> Option<StackFrame>
@@ -349,7 +347,7 @@ where
 
     for i in 0..scan_range {
         let address_of_pc = last_sp.checked_add(i * POINTER_WIDTH)?;
-        let caller_pc = stack_memory.get_memory_at_address(address_of_pc as u64)?;
+        let caller_pc = stack_memory.get_memory_at_address(address_of_pc)?;
         if instruction_seems_valid(caller_pc, modules, symbol_provider).await {
             // pc is pushed by CALL, so sp is just address_of_pc + ptr
             let caller_sp = address_of_pc.checked_add(POINTER_WIDTH)?;
@@ -372,7 +370,7 @@ where
             valid.insert(STACK_POINTER);
 
             let context = MinidumpContext {
-                raw: MinidumpRawContext::Arm64(caller_ctx),
+                raw: MinidumpRawContext::OldArm64(caller_ctx),
                 valid: MinidumpContextValidity::Some(valid),
             };
             return Some(StackFrame::from_context(context, FrameTrust::Scan));
@@ -417,7 +415,7 @@ where
         return false;
     }
 
-    super::instruction_seems_valid_by_symbols(instruction as u64, modules, symbol_provider).await
+    super::instruction_seems_valid_by_symbols(instruction, modules, symbol_provider).await
 }
 
 fn is_non_canonical(instruction: Pointer) -> bool {
@@ -431,7 +429,7 @@ fn is_non_canonical(instruction: Pointer) -> bool {
 fn stack_seems_valid(
     caller_sp: Pointer,
     callee_sp: Pointer,
-    stack_memory: &MinidumpMemory<'_>,
+    stack_memory: UnifiedMemory<'_, '_>,
 ) -> bool {
     // The stack shouldn't *grow* when we unwind
     if caller_sp < callee_sp {
@@ -451,7 +449,7 @@ impl Unwind for ArmContext {
         &self,
         callee: &StackFrame,
         grand_callee: Option<&StackFrame>,
-        stack_memory: Option<&MinidumpMemory<'_>>,
+        stack_memory: Option<UnifiedMemory<'_, '_>>,
         modules: &MinidumpModuleList,
         _system_info: &SystemInfo,
         syms: &P,
@@ -459,7 +457,7 @@ impl Unwind for ArmContext {
     where
         P: SymbolProvider + Sync,
     {
-        let stack = stack_memory.as_ref()?;
+        let stack = stack_memory?;
 
         // .await doesn't like closures, so don't use Option chaining
         let mut frame = None;
@@ -490,7 +488,7 @@ impl Unwind for ArmContext {
         // enforce progress and avoid infinite loops.
 
         let sp = frame.context.get_stack_pointer();
-        let last_sp = self.get_register_always("sp") as u64;
+        let last_sp = self.get_register_always("sp");
         if sp <= last_sp {
             // Arm leaf functions may not actually touch the stack (thanks
             // to the link register allowing you to "push" the return address
@@ -511,7 +509,7 @@ impl Unwind for ArmContext {
         // the value to 4 less than that, so it points to the CALL instruction
         // (arm64 instructions are all 4 bytes wide). This is important because
         // we use this value to lookup the CFI we need to unwind the next frame.
-        let ip = frame.context.get_instruction_pointer() as u64;
+        let ip = frame.context.get_instruction_pointer();
         frame.instruction = ip - 4;
 
         Some(frame)
