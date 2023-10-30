@@ -4,7 +4,7 @@
 //! CPU contexts.
 
 use num_traits::FromPrimitive;
-use scroll::{self, Pread, Pwrite};
+use scroll::{self, ctx::SizeWith, Pread, Pwrite};
 use std::collections::HashSet;
 use std::fmt;
 use std::io;
@@ -1183,7 +1183,7 @@ impl MinidumpContext {
         match self.raw {
             MinidumpRawContext::Amd64(ref ctx) => {
                 let mut offset: usize = 0;
-                bytes.resize(std::mem::size_of_val(ctx), 0);
+                bytes.resize(<md::CONTEXT_AMD64>::size_with(&endian), 0);
                 let _size = bytes
                     .gwrite_with(ctx, &mut offset, endian)
                     .or(Err(ContextError::ReadFailure))?;
@@ -1191,7 +1191,7 @@ impl MinidumpContext {
             }
             MinidumpRawContext::Arm(ref ctx) => {
                 let mut offset: usize = 0;
-                bytes.resize(std::mem::size_of_val(ctx), 0);
+                bytes.resize(<md::CONTEXT_ARM>::size_with(&endian), 0);
                 let _size = bytes
                     .gwrite_with(ctx, &mut offset, endian)
                     .or(Err(ContextError::ReadFailure))?;
@@ -1199,7 +1199,7 @@ impl MinidumpContext {
             }
             MinidumpRawContext::Arm64(ref ctx) => {
                 let mut offset: usize = 0;
-                bytes.resize(std::mem::size_of_val(ctx), 0);
+                bytes.resize(<md::CONTEXT_ARM64>::size_with(&endian), 0);
                 let _size = bytes
                     .gwrite_with(ctx, &mut offset, endian)
                     .or(Err(ContextError::ReadFailure))?;
@@ -1207,7 +1207,7 @@ impl MinidumpContext {
             }
             MinidumpRawContext::OldArm64(ref ctx) => {
                 let mut offset: usize = 0;
-                bytes.resize(std::mem::size_of_val(ctx), 0);
+                bytes.resize(<md::CONTEXT_ARM64_OLD>::size_with(&endian), 0);
                 let _size = bytes
                     .gwrite_with(ctx, &mut offset, endian)
                     .or(Err(ContextError::ReadFailure))?;
@@ -1215,7 +1215,7 @@ impl MinidumpContext {
             }
             MinidumpRawContext::Ppc(ref ctx) => {
                 let mut offset: usize = 0;
-                bytes.resize(std::mem::size_of_val(ctx), 0);
+                bytes.resize(<md::CONTEXT_PPC>::size_with(&endian), 0);
                 let _size = bytes
                     .gwrite_with(ctx, &mut offset, endian)
                     .or(Err(ContextError::ReadFailure))?;
@@ -1223,7 +1223,7 @@ impl MinidumpContext {
             }
             MinidumpRawContext::Ppc64(ref ctx) => {
                 let mut offset: usize = 0;
-                bytes.resize(std::mem::size_of_val(ctx), 0);
+                bytes.resize(<md::CONTEXT_PPC64>::size_with(&endian), 0);
                 let _size = bytes
                     .gwrite_with(ctx, &mut offset, endian)
                     .or(Err(ContextError::ReadFailure))?;
@@ -1231,7 +1231,7 @@ impl MinidumpContext {
             }
             MinidumpRawContext::Sparc(ref ctx) => {
                 let mut offset: usize = 0;
-                bytes.resize(std::mem::size_of_val(ctx), 0);
+                bytes.resize(<md::CONTEXT_SPARC>::size_with(&endian), 0);
                 let _size = bytes
                     .gwrite_with(ctx, &mut offset, endian)
                     .or(Err(ContextError::ReadFailure))?;
@@ -1239,7 +1239,7 @@ impl MinidumpContext {
             }
             MinidumpRawContext::X86(ref ctx) => {
                 let mut offset: usize = 0;
-                bytes.resize(std::mem::size_of_val(ctx), 0);
+                bytes.resize(<md::CONTEXT_X86>::size_with(&endian), 0);
                 let _size = bytes
                     .gwrite_with(ctx, &mut offset, endian)
                     .or(Err(ContextError::ReadFailure))?;
@@ -1247,7 +1247,7 @@ impl MinidumpContext {
             }
             MinidumpRawContext::Mips(ref ctx) => {
                 let mut offset: usize = 0;
-                bytes.resize(std::mem::size_of_val(ctx), 0);
+                bytes.resize(<md::CONTEXT_MIPS>::size_with(&endian), 0);
                 let _size = bytes
                     .gwrite_with(ctx, &mut offset, endian)
                     .or(Err(ContextError::ReadFailure))?;
